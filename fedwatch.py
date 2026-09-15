@@ -7,128 +7,129 @@ from playwright.sync_api import sync_playwright
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 THRESHOLD = 65.0
 
-CME_URLS = [
+URLS = [
     "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html",
     "https://www.cmegroup.cn/fed-watch/",
 ]
 
 
-def parse_pct(text):
-    if not text:
-        return 0.0
+def parse_date(text):
+    text = text.strip()
 
-    text = str(text)
-    match = re.search(r"([\d.]+)", text)
+    m = re.search(
+        r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})",
+        text
+    )
 
-    return float(match.group(1)) if match else 0.0
+    if m:
+        months = {
+            "Jan": "01", "Feb": "02", "Mar": "03",
+            "Apr": "04", "May": "05", "Jun": "06",
+            "Jul": "07", "Aug": "08", "Sep": "09",
+            "Oct": "10", "Nov": "11", "Dec": "12"
+        }
+
+        return (
+            f"{m.group(3)}-"
+            f"{months[m.group(2)]}-"
+            f"{int(m.group(1)):02d}"
+        )
+
+    return text
 
 
-def send_ntfy(message):
-    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+def parse_probabilities(text):
+
+    lines = text.splitlines()
+
+    ease = 0.0
+    no_change = 0.0
+    hike = 0.0
+
+    for i, line in enumerate(lines):
+
+        clean = re.sub(r"\s+", " ", line.strip()).upper()
+
+        if (
+            "EASE" in clean
+            and "NO CHANGE" in clean
+            and "HIKE" in clean
+        ):
+
+            # Buscar porcentajes en las siguientes líneas
+            for j in range(i, min(i + 5, len(lines))):
+
+                values = re.findall(
+                    r"(\d+(?:\.\d+)?)\s*%",
+                    lines[j]
+                )
+
+                if len(values) >= 3:
+
+                    ease = float(values[0])
+                    no_change = float(values[1])
+                    hike = float(values[2])
+
+                    return {
+                        "ease": ease,
+                        "no_change": no_change,
+                        "hike": hike
+                    }
+
+    return {
+        "ease": ease,
+        "no_change": no_change,
+        "hike": hike
+    }
+
+
+def extract_meeting(text):
+
+    # Ejemplo:
+    # 16 Sep 2026 ZQU6 30 Sep 2026 96.1400
+
+    match = re.search(
+        r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s+"
+        r"([A-Z0-9]+)\s+"
+        r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s+"
+        r"([\d.]+)",
+        text
+    )
+
+    if not match:
+        return None
+
+    return {
+        "date": parse_date(match.group(1)),
+        "contract": match.group(2),
+        "expiry": parse_date(match.group(3)),
+        "price": match.group(4)
+    }
+
+
+def send_notification(message):
 
     response = requests.post(
-        url,
+        f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={
-            "Title": "🚨 FEDWATCH > 65%",
+            "Title": "CME FedWatch > 65%",
             "Priority": "high",
-            "Tags": "warning,chart_with_upwards_trend",
+            "Tags": "warning"
         },
-        timeout=20,
+        timeout=20
     )
 
     response.raise_for_status()
 
-
-def extract_fedwatch(frame):
-
-    data = frame.evaluate("""
-    () => {
-
-        function pct(text) {
-            if (!text) return 0;
-            const m = text.replace(/[%<>≈]/g, '').match(/[0-9.]+/);
-            return m ? parseFloat(m[0]) : 0;
-        }
-
-        const result = {
-            meeting_date: "",
-            contract: "",
-            current_target: "",
-            summary: {
-                ease: 0,
-                no_change: 0,
-                hike: 0
-            }
-        };
-
-        const tables = document.querySelectorAll("table.grid-thm");
-
-        for (const table of tables) {
-
-            const text = table.innerText || "";
-
-            /*
-             * Meeting information
-             */
-            if (text.includes("Meeting Date")) {
-
-                const cells = table.querySelectorAll("td");
-
-                if (cells.length >= 4) {
-                    result.meeting_date = cells[0].innerText.trim();
-                    result.contract = cells[1].innerText.trim();
-                }
-            }
-
-            /*
-             * Probability summary
-             */
-            if (text.includes("Probabilities")) {
-
-                const rows = table.querySelectorAll("tr");
-
-                for (const row of rows) {
-
-                    const cells = row.querySelectorAll("td");
-
-                    if (cells.length >= 3) {
-
-                        result.summary = {
-                            ease: pct(cells[0].innerText),
-                            no_change: pct(cells[1].innerText),
-                            hike: pct(cells[2].innerText)
-                        };
-                    }
-                }
-            }
-        }
-
-        /*
-         * Current target rate
-         */
-        const allText = document.body.innerText;
-
-        const target = allText.match(
-            /Current target rate is\\s*([0-9]+-[0-9]+)/
-        );
-
-        if (target) {
-            result.current_target = target[1];
-        }
-
-        return result;
-    }
-    """)
-
-    return data
+    print("✅ NTFY ENVIADO")
 
 
 def main():
 
-    print("======================================")
-    print(" CME FEDWATCH MONITOR")
-    print("======================================")
+    print("=" * 50)
+    print("CME FEDWATCH MONITOR")
+    print("=" * 50)
 
     with sync_playwright() as p:
 
@@ -150,9 +151,9 @@ def main():
 
         fedwatch_frame = None
 
-        for url in CME_URLS:
+        for url in URLS:
 
-            print(f"Abriendo: {url}")
+            print(f"\nAbriendo: {url}")
 
             try:
 
@@ -162,12 +163,12 @@ def main():
                     timeout=60000
                 )
 
-                for seconds in range(0, 91, 5):
+                for seconds in range(5, 91, 5):
 
                     time.sleep(5)
 
                     print(
-                        f"Esperando FedWatch... {seconds + 5}s"
+                        f"Esperando FedWatch... {seconds}s"
                     )
 
                     for frame in page.frames:
@@ -181,6 +182,11 @@ def main():
                                 and len(text) > 500
                             ):
                                 fedwatch_frame = frame
+
+                                print(
+                                    "✅ Widget FedWatch encontrado"
+                                )
+
                                 break
 
                         except Exception:
@@ -190,85 +196,186 @@ def main():
                         break
 
                 if fedwatch_frame:
-                    print("✅ FedWatch encontrado.")
                     break
 
             except Exception as e:
 
-                print(
-                    f"No se pudo cargar {url}: {e}"
-                )
+                print(f"Error cargando página: {e}")
 
         if not fedwatch_frame:
 
             browser.close()
 
             raise RuntimeError(
-                "No se pudo cargar el widget FedWatch de CME."
+                "CME FedWatch no pudo cargar."
             )
 
-        data = extract_fedwatch(fedwatch_frame)
+        # -------------------------------------------------
+        # BUSCAR LAS REUNIONES
+        # -------------------------------------------------
 
-        print("")
-        print("RESULTADO:")
-        print(data)
+        tabs = fedwatch_frame.evaluate("""
+        () => {
 
-        meeting = data["meeting_date"]
+            const links =
+                document.querySelectorAll(
+                    'a[id*="lbMeeting"]'
+                );
+
+            return Array.from(links).map(a => ({
+                id: a.id,
+                text: a.textContent.trim()
+            }));
+
+        }
+        """)
+
+        print(
+            f"Reuniones encontradas: {len(tabs)}"
+        )
+
+        if not tabs:
+
+            browser.close()
+
+            raise RuntimeError(
+                "CME cargó, pero no aparecen las reuniones."
+            )
+
+        # Primera reunión = próxima reunión
+        first_tab = tabs[0]
+
+        print(
+            f"Próxima reunión detectada: "
+            f"{first_tab['text']}"
+        )
+
+        # -------------------------------------------------
+        # EXTRAER DATOS DE LA REUNIÓN ACTUAL
+        # -------------------------------------------------
+
+        text = fedwatch_frame.inner_text("body")
+
+        meeting = extract_meeting(text)
+        probabilities = parse_probabilities(text)
+
+        # Si el texto inicial no contiene la reunión,
+        # pulsamos la primera pestaña.
 
         if not meeting:
-            browser.close()
-            raise RuntimeError(
-                "FedWatch cargó, pero no encontramos la reunión."
+
+            print("Pulsando primera reunión...")
+
+            fedwatch_frame.evaluate(
+                """
+                id => {
+                    const el =
+                        document.getElementById(id);
+
+                    if (el) {
+                        el.click();
+                        return true;
+                    }
+
+                    return false;
+                }
+                """,
+                first_tab["id"]
             )
 
-        summary = data["summary"]
+            time.sleep(3)
+
+            text = fedwatch_frame.inner_text("body")
+
+            meeting = extract_meeting(text)
+            probabilities = parse_probabilities(text)
+
+        if not meeting:
+
+            browser.close()
+
+            raise RuntimeError(
+                "Encontré FedWatch pero no pude extraer "
+                "la fecha de la reunión."
+            )
+
+        # -------------------------------------------------
+        # MOSTRAR RESULTADO
+        # -------------------------------------------------
 
         print("")
-        print(f"Reunión: {meeting}")
-        print(f"Recorte: {summary['ease']}%")
-        print(f"Mantener: {summary['no_change']}%")
-        print(f"Alza: {summary['hike']}%")
+        print("RESULTADO CME FEDWATCH")
+        print("-" * 40)
+
+        print(
+            f"Reunión: {meeting['date']}"
+        )
+
+        print(
+            f"Contrato: {meeting['contract']}"
+        )
+
+        print(
+            f"RECORTE: {probabilities['ease']:.1f}%"
+        )
+
+        print(
+            f"MANTENER: "
+            f"{probabilities['no_change']:.1f}%"
+        )
+
+        print(
+            f"ALZA: {probabilities['hike']:.1f}%"
+        )
+
+        # -------------------------------------------------
+        # ALERTAS
+        # -------------------------------------------------
 
         alerts = []
 
-        if summary["ease"] >= THRESHOLD:
+        if probabilities["ease"] >= THRESHOLD:
+
             alerts.append(
-                f"🟢 RECORTE: {summary['ease']:.1f}%"
+                f"🟢 RECORTE: "
+                f"{probabilities['ease']:.1f}%"
             )
 
-        if summary["no_change"] >= THRESHOLD:
+        if probabilities["no_change"] >= THRESHOLD:
+
             alerts.append(
-                f"⚪ MANTENER: {summary['no_change']:.1f}%"
+                f"⚪ MANTENER: "
+                f"{probabilities['no_change']:.1f}%"
             )
 
-        if summary["hike"] >= THRESHOLD:
+        if probabilities["hike"] >= THRESHOLD:
+
             alerts.append(
-                f"🔴 ALZA: {summary['hike']:.1f}%"
+                f"🔴 ALZA: "
+                f"{probabilities['hike']:.1f}%"
             )
 
         if alerts:
 
             message = (
                 "CME FEDWATCH\n\n"
-                f"Próxima reunión: {meeting}\n\n"
+                f"Próxima reunión: {meeting['date']}\n"
+                f"Contrato: {meeting['contract']}\n\n"
                 + "\n".join(alerts)
-                + "\n\n"
-                f"Umbral: {THRESHOLD}%"
+                + f"\n\nUmbral: {THRESHOLD}%"
             )
 
             print("")
             print(message)
 
-            send_ntfy(message)
-
-            print("")
-            print("✅ ALERTA ENVIADA AL IPHONE")
+            send_notification(message)
 
         else:
 
             print("")
             print(
-                f"Sin probabilidades >= {THRESHOLD}%."
+                f"ℹ️ Ninguna probabilidad supera "
+                f"{THRESHOLD}%."
             )
 
         browser.close()
