@@ -1,14 +1,19 @@
 import os
+import re
 import requests
-from cme_fedwatch import get_probabilities
+from bs4 import BeautifulSoup
 
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 UMBRAL = 65.0
 
+URL = "https://www.frenzycap.com/fedwatch"
 
-def alerta(titulo, mensaje):
-    requests.post(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
+
+def enviar_alerta(titulo, mensaje):
+    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+
+    response = requests.post(
+        url,
         data=mensaje.encode("utf-8"),
         headers={
             "Title": titulo,
@@ -16,53 +21,120 @@ def alerta(titulo, mensaje):
             "Tags": "rotating_light"
         },
         timeout=15
-    ).raise_for_status()
+    )
+
+    response.raise_for_status()
+
+
+def obtener_fedwatch():
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140 Safari/537.36"
+        )
+    }
+
+    r = requests.get(URL, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    texto = soup.get_text(" ", strip=True)
+
+    # Buscar la primera reunión FOMC
+    patron = re.search(
+        r"(Sep|Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug)"
+        r"\s+\d{1,2},\s+2026",
+        texto
+    )
+
+    if not patron:
+        raise Exception("No se encontró la próxima reunión FOMC.")
+
+    fecha = patron.group(0)
+
+    # Buscar porcentajes posteriores a la fecha.
+    resto = texto[patron.end():patron.end() + 1200]
+
+    porcentajes = [
+        float(x)
+        for x in re.findall(r"(\d+(?:\.\d+)?)%", resto)
+    ]
+
+    if len(porcentajes) < 2:
+        raise Exception(
+            f"No se pudieron encontrar probabilidades. "
+            f"Datos encontrados: {porcentajes}"
+        )
+
+    return fecha, porcentajes
 
 
 def main():
 
-    data = get_probabilities("next")
+    fecha, porcentajes = obtener_fedwatch()
 
-    meeting = data["meetings"][0]
+    print("===================================")
+    print("FEDWATCH MONITOR")
+    print("===================================")
+    print(f"Reunión: {fecha}")
+    print(f"Probabilidades encontradas: {porcentajes}")
 
-    fecha = meeting["date"]
-    probabilidades = meeting["probabilities"]
+    # Para la próxima reunión normalmente tendremos:
+    # HOLD + HIKE o HOLD + CUT.
+    #
+    # Determinamos el escenario dominante.
+    mayor = max(porcentajes[:5])
 
-    print(f"Próxima reunión: {fecha}")
-    print(probabilidades)
-
-    # Buscar la tasa actual
-    current_target = data.get("current_target", "")
-
-    # Convertir las probabilidades
-    resultados = []
-
-    for rango, prob in probabilidades.items():
-
-        prob = float(prob)
-
-        if prob >= UMBRAL:
-            resultados.append(
-                (rango, prob)
-            )
-
-    if not resultados:
-        print("Ninguna probabilidad supera 65%.")
+    if mayor < UMBRAL:
+        print(
+            f"Ninguna probabilidad supera {UMBRAL}%."
+        )
         return
 
-    for rango, prob in resultados:
+    # En el escenario actual, el movimiento alcista
+    # aparece después de la probabilidad de mantener.
+    if len(porcentajes) >= 2:
 
-        titulo = "🚨 FEDWATCH > 65%"
+        p1 = porcentajes[0]
+        p2 = porcentajes[1]
 
-        mensaje = (
-            f"Próxima reunión FOMC: {fecha}\n\n"
-            f"Resultado probable: {rango}\n"
-            f"Probabilidad: {prob:.1f}%\n\n"
-            f"Tasa actual: {current_target}\n\n"
-            f"⚠️ Probabilidad superior al {UMBRAL:.0f}%."
-        )
+        if p2 >= UMBRAL:
 
-        alerta(titulo, mensaje)
+            titulo = "🚨 FEDWATCH — ALZA > 65%"
+
+            mensaje = (
+                f"Próxima reunión FOMC: {fecha}\n\n"
+                f"⚪ Mantener: {p1:.1f}%\n"
+                f"🔴 Alza: {p2:.1f}%\n\n"
+                f"🚨 Probabilidad de ALZA supera "
+                f"{UMBRAL:.0f}%.\n\n"
+                f"Confirmar con:\n"
+                f"• Treasury 10Y\n"
+                f"• USD\n"
+                f"• CPI / PCE / NFP\n"
+                f"• Discurso de la Fed"
+            )
+
+            enviar_alerta(titulo, mensaje)
+
+        elif p1 >= UMBRAL:
+
+            titulo = "ℹ️ FEDWATCH — MANTENER > 65%"
+
+            mensaje = (
+                f"Próxima reunión FOMC: {fecha}\n\n"
+                f"⚪ Mantener: {p1:.1f}%\n"
+                f"🔴 Alza: {p2:.1f}%\n\n"
+                f"Probabilidad de MANTENER supera "
+                f"{UMBRAL:.0f}%."
+            )
+
+            enviar_alerta(titulo, mensaje)
+
+    print("Monitor terminado correctamente.")
 
 
 if __name__ == "__main__":
