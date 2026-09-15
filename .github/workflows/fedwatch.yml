@@ -18,8 +18,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Instalar requests
-        run: pip install requests
+      - - name: Instalar dependencias
+  run: pip install requests cme-fedwatch
 
       - name: Ejecutar FedWatch
         env:
