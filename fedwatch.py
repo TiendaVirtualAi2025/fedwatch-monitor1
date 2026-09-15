@@ -11,7 +11,7 @@ def send_ntfy(message):
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={
-            "Title": "🚨 FEDWATCH > 65%",
+            "Title": "FEDWATCH > 65%",
             "Priority": "high",
             "Tags": "warning"
         },
@@ -68,31 +68,45 @@ def main():
 
         if probability >= THRESHOLD:
 
-            # Determinar dirección
             if rate == current_target:
-                direction = "⚪ MANTENER"
+
+                direction = "MANTENER"
 
             else:
+
                 try:
+
                     current_upper = float(
-                        current_target.split("-")[1].replace("%", "")
+                        current_target
+                        .split("-")[1]
+                        .replace("%", "")
                     )
 
                     target_upper = float(
-                        rate.split("-")[1].replace("%", "")
+                        rate
+                        .split("-")[1]
+                        .replace("%", "")
                     )
 
                     if target_upper > current_upper:
-                        direction = "🔴 ALZA"
+                        direction = "ALZA"
                     else:
-                        direction = "🟢 RECORTE"
+                        direction = "RECORTE"
 
                 except Exception:
-                    direction = "📊 CAMBIO"
+
+                    direction = "CAMBIO"
+
+            if direction == "ALZA":
+                icon = "🔴"
+            elif direction == "RECORTE":
+                icon = "🟢"
+            else:
+                icon = "⚪"
 
             alerts.append(
-                f"{direction}: {rate} → "
-                f"{probability:.1f}%"
+                f"{icon} {direction}: "
+                f"{rate} → {probability:.1f}%"
             )
 
     print("")
@@ -100,7 +114,7 @@ def main():
     if not alerts:
 
         print(
-            f"ℹ️ Ninguna probabilidad supera "
+            f"Ninguna probabilidad supera "
             f"{THRESHOLD}%."
         )
 
@@ -108,7 +122,7 @@ def main():
 
     message = (
         "CME FEDWATCH\n\n"
-        f"Próxima reunión: {meeting_date}\n"
+        f"Proxima reunion: {meeting_date}\n"
         f"Tasa actual: {current_target}\n\n"
         + "\n".join(alerts)
         + f"\n\nUmbral: {THRESHOLD}%"
@@ -119,7 +133,9 @@ def main():
     send_ntfy(message)
 
     print("")
+    print("======================================")
     print("✅ ALERTA ENVIADA AL IPHONE")
+    print("======================================")
 
 
 if __name__ == "__main__":
