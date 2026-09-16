@@ -1,39 +1,68 @@
 name: CME FedWatch Monitor
+
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: "*/15 * * * *"
   workflow_dispatch:
+
+# Evita ejecuciones simultáneas que intenten hacer push del mismo estado.
+concurrency:
+  group: cme-fedwatch-monitor-main
+  cancel-in-progress: true
+
 permissions:
   contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 6
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+
       - name: Install system packages
-        run: sudo apt-get update && sudo apt-get install -y xvfb curl
-      - name: Install Playwright
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb curl
+
+      - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'playwright>=1.40.0'
+          python -m pip install "playwright>=1.40.0"
+
+      - name: Install Chromium
+        run: |
           python -m playwright install --with-deps chromium
-      - name: Run monitor
+
+      - name: Run FedWatch monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: xvfb-run -a -s '-screen 0 1920x1080x24' python fedwatch.py
-      - name: Save state
-        if: always()
         run: |
-          if [ -f fedwatch_state.json ]; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add fedwatch_state.json
-            git diff --cached --quiet || git commit -m 'Update FedWatch state'
-            git push
+          xvfb-run -a -s "-screen 0 1920x1080x24" python fedwatch.py
+
+      # Solo guardamos el estado si el monitor terminó correctamente.
+      - name: Save monitor state
+        if: success() && hashFiles('fedwatch_state.json') != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add fedwatch_state.json
+
+          if git diff --cached --quiet; then
+            echo "Sin cambios en el estado."
+            exit 0
           fi
+
+          git commit -m "Update FedWatch state"
+          git pull --rebase origin main
+          git push origin HEAD:main
