@@ -1,688 +1,1490 @@
-import os
-import json
-import requests
-from datetime import date
+#!/usr/bin/env python3
 
-from cme_fedwatch import get_probabilities
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from playwright.sync_api import sync_playwright
 
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-UMBRAL_ALERTA = 65.0
+CME_URL = "https://www.cmegroup.cn/fed-watch/"
 
-# Nueva alerta solamente si cambia 10 puntos porcentuales
-DELTA_MINIMO_CAMBIO = 10.0
+THRESHOLD = 65.0
+CHANGE_ALERT = 10.0
 
-STATE_FILE = "last_state.json"
+STATE_FILE = Path("fedwatch_state.json")
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def parse_pct(value):
+    if value is None:
+        return 0.0
+
+    text = str(value)
+
+    text = (
+        text.replace("%", "")
+        .replace("<", "")
+        .replace(">", "")
+        .replace("≈", "")
+        .replace("\u200b", "")
+        .strip()
+    )
+
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+
+    if not match:
+        return 0.0
+
+    return float(match.group(1))
+
+
+def parse_date(text):
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # Ejemplo:
+    # 16 9月 2026
+    match = re.search(
+        r"(\d{1,2})\s*(\d{1,2})月\s*(\d{4})",
+        text
+    )
+
+    if match:
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3))
+
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # Ejemplo:
+    # 16 Sep 2026
+    match = re.search(
+        r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})",
+        text
+    )
+
+    if match:
+        day = int(match.group(1))
+        month_text = match.group(2)
+        year = int(match.group(3))
+
+        try:
+            month = datetime.strptime(
+                month_text,
+                "%b"
+            ).month
+
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+        except ValueError:
+            pass
+
+    return text
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            state,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+
+# ============================================================
+# EXTRACCIÓN DEL DOM DE QUIKSTRIKE
+# ============================================================
+
+def extract_meeting_from_dom(frame):
+
+    javascript = r"""
+    () => {
+
+        function findInnerTable(keyword) {
+
+            const tables =
+                document.querySelectorAll("table.grid-thm");
+
+            for (const table of tables) {
+
+                const text =
+                    Array.from(
+                        table.querySelectorAll("th, td")
+                    )
+                    .map(el => el.textContent.trim())
+                    .join(" ");
+
+                if (text.includes(keyword)) {
+                    return table;
+                }
+            }
+
+            return null;
+        }
+
+
+        function parsePct(value) {
+
+            if (!value) {
+                return 0;
+            }
+
+            const cleaned =
+                value
+                    .toString()
+                    .replace(/[%<>≈\u200b]/g, "")
+                    .trim();
+
+            const match =
+                cleaned.match(/([\d.]+)/);
+
+            return match
+                ? parseFloat(match[1])
+                : 0;
+        }
+
+
+        const result = {
+            meeting_date: "",
+            contract: "",
+            expires: "",
+            mid_price: "",
+            current_target: "",
+            summary: {},
+            table: []
+        };
+
+
+        // ----------------------------------------------------
+        // INFORMACIÓN DE LA REUNIÓN
+        // ----------------------------------------------------
+
+        const infoTable =
+            findInnerTable("Meeting Date");
+
+        if (infoTable) {
+
+            const cells =
+                infoTable.querySelectorAll("td");
+
+            if (cells.length >= 4) {
+
+                result.meeting_date =
+                    cells[0].textContent.trim();
+
+                result.contract =
+                    cells[1].textContent.trim();
+
+                result.expires =
+                    cells[2].textContent.trim();
+
+                result.mid_price =
+                    cells[3].textContent.trim();
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // RESUMEN:
+        // EASE / NO CHANGE / HIKE
+        // ----------------------------------------------------
+
+        const probabilityTable =
+            findInnerTable("Probabilities");
+
+        if (probabilityTable) {
+
+            const rows =
+                probabilityTable.querySelectorAll("tr");
+
+            for (const row of rows) {
+
+                const cells =
+                    row.querySelectorAll("td");
+
+                if (cells.length >= 3) {
+
+                    const values =
+                        Array.from(cells)
+                        .map(c => c.textContent.trim());
+
+                    const percentages =
+                        values
+                        .map(parsePct)
+                        .filter(v => v >= 0);
+
+                    if (percentages.length >= 3) {
+
+                        result.summary = {
+
+                            ease: percentages[0],
+
+                            no_change:
+                                percentages[1],
+
+                            hike:
+                                percentages[2]
+                        };
+
+                        break;
+                    }
+                }
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // TABLA DE TARGET RATES
+        // ----------------------------------------------------
+
+        const rateTable =
+            findInnerTable("Target Rate (bps)");
+
+        if (rateTable) {
+
+            const rows =
+                rateTable.querySelectorAll("tr");
+
+            for (const row of rows) {
+
+                if (row.classList.contains("hide")) {
+                    continue;
+                }
+
+                const cells =
+                    row.querySelectorAll("td");
+
+                if (cells.length < 2) {
+                    continue;
+                }
+
+                const range =
+                    cells[0].textContent.trim();
+
+                if (!/^\d+-\d+/.test(range)) {
+                    continue;
+                }
+
+                const values =
+                    Array.from(cells)
+                    .slice(1)
+                    .map(c => c.textContent.trim());
+
+                result.table.push({
+
+                    range: range,
+
+                    now:
+                        parsePct(values[0]),
+
+                    day1:
+                        parsePct(values[1]),
+
+                    week1:
+                        parsePct(values[2]),
+
+                    month1:
+                        parsePct(values[3])
+                });
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // TASA ACTUAL
+        // ----------------------------------------------------
+
+        const all =
+            document.querySelectorAll("*");
+
+        for (const element of all) {
+
+            const match =
+                element.textContent.match(
+                    /Current target rate is (\d+-\d+)/i
+                );
+
+            if (match) {
+
+                result.current_target =
+                    match[1];
+
+                break;
+            }
+        }
+
+
+        return result;
+    }
+    """
+
+    try:
+        return frame.evaluate(javascript)
+    except Exception:
+        return None
+
+
+# ============================================================
+# TEXTO COMO RESPALDO
+# ============================================================
+
+def extract_from_text(text):
+
+    result = {
+        "meeting_date": "",
+        "current_target": "",
+        "summary": {},
+        "table": []
+    }
+
+    # --------------------------------------------------------
+    # FECHA
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"(\d{1,2}\s*\d{1,2}月\s*\d{4})",
+        text
+    )
+
+    if match:
+        result["meeting_date"] =
+            parse_date(match.group(1))
+
+    if not result["meeting_date"]:
+
+        match = re.search(
+            r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            text
+        )
+
+        if match:
+            result["meeting_date"] =
+                parse_date(match.group(1))
+
+
+    # --------------------------------------------------------
+    # CURRENT TARGET RATE
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"Current target rate is\s+(\d+-\d+)",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        result["current_target"] =
+            match.group(1)
+
+
+    # --------------------------------------------------------
+    # EASE / NO CHANGE / HIKE
+    # --------------------------------------------------------
+
+    lines = text.splitlines()
+
+    for index, line in enumerate(lines):
+
+        if re.search(
+            r"EASE\s+NO\s*CHANGE\s+HIKE",
+            line,
+            re.IGNORECASE
+        ):
+
+            for next_line in lines[
+                index + 1:index + 5
+            ]:
+
+                values = re.findall(
+                    r"([\d.]+)\s*%",
+                    next_line
+                )
+
+                if len(values) >= 3:
+
+                    result["summary"] = {
+
+                        "ease":
+                            float(values[0]),
+
+                        "no_change":
+                            float(values[1]),
+
+                        "hike":
+                            float(values[2])
+                    }
+
+                    break
+
+            break
+
+
+    # --------------------------------------------------------
+    # TARGET RATE TABLE
+    # --------------------------------------------------------
+
+    found_header = False
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        if (
+            "TARGET RATE" in stripped.upper()
+            and
+            "PROBABILITY" in stripped.upper()
+        ):
+
+            found_header = True
+            continue
+
+        if not found_header:
+            continue
+
+        match = re.match(
+            r"^(\d+-\d+.*?)\s+(.+)$",
+            stripped
+        )
+
+        if not match:
+            continue
+
+        rate_range = match.group(1).strip()
+
+        if not re.match(
+            r"^\d+-\d+",
+            rate_range
+        ):
+            continue
+
+        percentages = re.findall(
+            r"[\d.]+%",
+            match.group(2)
+        )
+
+        if not percentages:
+            continue
+
+        result["table"].append({
+
+            "range":
+                rate_range,
+
+            "now":
+                parse_pct(percentages[0]),
+
+            "day1":
+                parse_pct(percentages[1])
+                if len(percentages) > 1
+                else 0,
+
+            "week1":
+                parse_pct(percentages[2])
+                if len(percentages) > 2
+                else 0,
+
+            "month1":
+                parse_pct(percentages[3])
+                if len(percentages) > 3
+                else 0
+        })
+
+
+    return result
+
+
+# ============================================================
+# SCRAPER PRINCIPAL
+# ============================================================
+
+def scrape_fedwatch():
+
+    print()
+    print("=" * 60)
+    print("CME FEDWATCH — LIVE SCRAPER")
+    print("=" * 60)
+    print(f"Fuente: {CME_URL}")
+    print()
+
+
+    with sync_playwright() as playwright:
+
+        print("Iniciando Chromium...")
+
+        browser = playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--window-size=1920,1080"
+            ]
+        )
+
+        context = browser.new_context(
+            viewport={
+                "width": 1920,
+                "height": 1080
+            },
+            user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="America/Chicago"
+        )
+
+        page = context.new_page()
+
+        print("Abriendo CME...")
+
+        try:
+
+            page.goto(
+                CME_URL,
+                wait_until="domcontentloaded",
+                timeout=90000
+            )
+
+        except Exception as error:
+
+            print(
+                f"Advertencia al abrir CME: {error}"
+            )
+
+            # La página puede seguir cargando aunque
+            # Playwright informe timeout.
+            time.sleep(10)
+
+
+        print("Esperando QuikStrike...")
+
+        qs_frame = None
+
+        # Hasta 120 segundos para que QuikStrike
+        # cargue completamente.
+        for elapsed in range(0, 121, 5):
+
+            time.sleep(5)
+
+            print(
+                f"  Esperando... {elapsed + 5}s"
+            )
+
+            for frame in page.frames:
+
+                try:
+
+                    text =
+                        frame.locator("body").inner_text(
+                            timeout=3000
+                        )
+
+                    upper =
+                        text.upper()
+
+                    if (
+                        "EASE" in upper
+                        and
+                        (
+                            "HIKE" in upper
+                            or
+                            "NO CHANGE" in upper
+                        )
+                        and
+                        len(text) > 500
+                    ):
+
+                        qs_frame = frame
+
+                        print(
+                            "✓ QuikStrike encontrado."
+                        )
+
+                        break
+
+                except Exception:
+                    continue
+
+            if qs_frame:
+                break
+
+
+        if not qs_frame:
+
+            print()
+            print(
+                "ERROR: CME cargó, pero "
+                "QuikStrike no apareció."
+            )
+
+            # Intentamos guardar diagnóstico
+            try:
+                page.screenshot(
+                    path="fedwatch_error.png",
+                    full_page=True
+                )
+            except Exception:
+                pass
+
+            browser.close()
+
+            raise RuntimeError(
+                "QuikStrike no se pudo cargar."
+            )
+
+
+        # ----------------------------------------------------
+        # ENCONTRAR REUNIONES
+        # ----------------------------------------------------
+
+        print("Buscando reuniones FOMC...")
+
+        tabs = qs_frame.evaluate(
+            """
+            () => {
+
+                const links =
+                    document.querySelectorAll(
+                        'a[id*="lbMeeting"]'
+                    );
+
+                return Array.from(links).map(
+                    a => ({
+                        id: a.id,
+                        text: a.textContent.trim()
+                    })
+                );
+            }
+            """
+        )
+
+        if not tabs:
+
+            browser.close()
+
+            raise RuntimeError(
+                "No se encontraron las reuniones FOMC."
+            )
+
+
+        print(
+            f"✓ {len(tabs)} reuniones encontradas."
+        )
+
+
+        meetings = []
+
+
+        # ----------------------------------------------------
+        # LEER CADA REUNIÓN
+        # ----------------------------------------------------
+
+        previous_date = None
+
+        for index, tab in enumerate(tabs):
+
+            print(
+                f"Reunión {index + 1}/{len(tabs)}: "
+                f"{tab['text']}"
+            )
+
+
+            # Fecha anterior antes del click
+            if index > 0:
+
+                try:
+
+                    previous_date =
+                        qs_frame.evaluate(
+                            """
+                            () => {
+
+                                const tables =
+                                    document.querySelectorAll(
+                                        "table.grid-thm"
+                                    );
+
+                                for (const table of tables) {
+
+                                    const text =
+                                        table.innerText;
+
+                                    if (
+                                        text.includes(
+                                            "Meeting Date"
+                                        )
+                                    ) {
+
+                                        const cells =
+                                            table.querySelectorAll(
+                                                "td"
+                                            );
+
+                                        return cells.length
+                                            ? cells[0]
+                                                .textContent
+                                                .trim()
+                                            : "";
+                                    }
+                                }
+
+                                return "";
+                            }
+                            """
+                        )
+
+                except Exception:
+                    previous_date = None
+
+
+            # ------------------------------------------------
+            # CLICK EN REUNIÓN
+            # ------------------------------------------------
+
+            clicked = qs_frame.evaluate(
+                """
+                (id) => {
+
+                    const element =
+                        document.getElementById(id);
+
+                    if (!element) {
+                        return false;
+                    }
+
+                    element.click();
+
+                    return true;
+                }
+                """,
+                tab["id"]
+            )
+
+
+            if not clicked:
+                print("  No se pudo seleccionar.")
+                continue
+
+
+            # ------------------------------------------------
+            # ESPERAR POSTBACK ASP.NET
+            # ------------------------------------------------
+
+            for _ in range(40):
+
+                time.sleep(0.3)
+
+                try:
+
+                    ready =
+                        qs_frame.evaluate(
+                            """
+                            (previousDate) => {
+
+                                const loading =
+                                    document.querySelector(
+                                        ".throbber, [class*='loading']"
+                                    );
+
+                                if (
+                                    loading &&
+                                    loading.offsetParent !== null
+                                ) {
+                                    return false;
+                                }
+
+                                if (!previousDate) {
+                                    return true;
+                                }
+
+                                const tables =
+                                    document.querySelectorAll(
+                                        "table.grid-thm"
+                                    );
+
+                                for (const table of tables) {
+
+                                    if (
+                                        table.innerText.includes(
+                                            "Meeting Date"
+                                        )
+                                    ) {
+
+                                        const cells =
+                                            table.querySelectorAll(
+                                                "td"
+                                            );
+
+                                        const current =
+                                            cells.length
+                                                ? cells[0]
+                                                    .textContent
+                                                    .trim()
+                                                : "";
+
+                                        return (
+                                            current &&
+                                            current !== previousDate
+                                        );
+                                    }
+                                }
+
+                                return false;
+                            }
+                            """,
+                            previous_date
+                        )
+
+                    if ready:
+                        break
+
+                except Exception:
+                    pass
+
+
+            time.sleep(0.5)
+
+
+            # ------------------------------------------------
+            # EXTRAER DATOS
+            # ------------------------------------------------
+
+            data =
+                extract_meeting_from_dom(
+                    qs_frame
+                )
+
+
+            if not data or not data.get("table"):
+
+                print(
+                    "  DOM vacío. Usando respaldo de texto..."
+                )
+
+                try:
+
+                    text =
+                        qs_frame.locator(
+                            "body"
+                        ).inner_text(
+                            timeout=5000
+                        )
+
+                    data =
+                        extract_from_text(text)
+
+                except Exception:
+
+                    data = None
+
+
+            if not data:
+                print("  ERROR leyendo reunión.")
+                continue
+
+
+            meeting_date =
+                parse_date(
+                    data.get(
+                        "meeting_date",
+                        ""
+                    )
+                )
+
+
+            summary =
+                data.get(
+                    "summary",
+                    {}
+                )
+
+
+            print(
+                f"  Fecha: {meeting_date}"
+            )
+
+            print(
+                f"  ALZA: "
+                f"{summary.get('hike', 0)}%"
+            )
+
+            print(
+                f"  MANTENER: "
+                f"{summary.get('no_change', 0)}%"
+            )
+
+            print(
+                f"  RECORTE: "
+                f"{summary.get('ease', 0)}%"
+            )
+
+
+            meetings.append({
+
+                "meeting_date":
+                    meeting_date,
+
+                "summary":
+                    summary,
+
+                "table":
+                    data.get(
+                        "table",
+                        []
+                    ),
+
+                "current_target":
+                    data.get(
+                        "current_target",
+                        ""
+                    )
+            })
+
+
+        browser.close()
+
+
+    if not meetings:
+
+        raise RuntimeError(
+            "CME no devolvió ninguna reunión."
+        )
+
+
+    return meetings
+
+
+# ============================================================
+# ENCONTRAR PRÓXIMA REUNIÓN
+# ============================================================
+
+def get_next_meeting(meetings):
+
+    today =
+        datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d")
+
+
+    valid = []
+
+    for meeting in meetings:
+
+        date =
+            meeting.get(
+                "meeting_date",
+                ""
+            )
+
+        if re.match(
+            r"^\d{4}-\d{2}-\d{2}$",
+            date
+        ):
+
+            if date >= today:
+
+                valid.append(meeting)
+
+
+    if not valid:
+        return None
+
+
+    valid.sort(
+        key=lambda x:
+            x["meeting_date"]
+    )
+
+
+    return valid[0]
+
+
+# ============================================================
+# DETERMINAR SEÑAL
+# ============================================================
+
+def determine_signal(summary):
+
+    hike =
+        float(
+            summary.get(
+                "hike",
+                0
+            )
+        )
+
+    ease =
+        float(
+            summary.get(
+                "ease",
+                0
+            )
+        )
+
+    hold =
+        float(
+            summary.get(
+                "no_change",
+                0
+            )
+        )
+
+
+    values = {
+
+        "ALZA":
+            hike,
+
+        "RECORTE":
+            ease,
+
+        "MANTENER":
+            hold
+    }
+
+
+    direction =
+        max(
+            values,
+            key=values.get
+        )
+
+    probability =
+        values[direction]
+
+
+    return direction, probability, values
+
+
+# ============================================================
+# DECIDIR SI HAY QUE ENVIAR ALERTA
+# ============================================================
+
+def should_alert(
+    state,
+    meeting_date,
+    direction,
+    probability
+):
+
+    if probability < THRESHOLD:
+
+        return False, "Por debajo de 65%"
+
+
+    previous_meeting =
+        state.get(
+            "meeting_date"
+        )
+
+    previous_direction =
+        state.get(
+            "direction"
+        )
+
+    previous_probability =
+        state.get(
+            "probability"
+        )
+
+
+    # Primera señal
+    if previous_meeting is None:
+
+        return True, "Primera señal >=65%"
+
+
+    # Cambió la reunión
+    if previous_meeting != meeting_date:
+
+        return True, "Nueva reunión FOMC"
+
+
+    # Cambió la dirección
+    if (
+        previous_direction
+        and
+        previous_direction != direction
+    ):
+
+        return True, "Cambio de dirección"
+
+
+    # Cambio >= 10 puntos
+    if previous_probability is not None:
+
+        difference =
+            abs(
+                probability
+                -
+                float(previous_probability)
+            )
+
+        if difference >= CHANGE_ALERT:
+
+            return True, (
+                f"Cambio de "
+                f"{difference:.1f} puntos"
+            )
+
+
+    return False, "Sin cambio suficiente"
 
 
 # ============================================================
 # NTFY
 # ============================================================
 
-def send_ntfy(title, message):
+def send_ntfy(
+    direction,
+    probability,
+    meeting_date,
+    values,
+    reason
+):
 
     if not NTFY_TOPIC:
-        raise RuntimeError(
-            "ERROR: NTFY_TOPIC no está configurado."
+
+        print(
+            "ERROR: falta el secreto NTFY_TOPIC."
         )
 
-    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+        return False
 
-    response = requests.post(
-        url,
-        data=message.encode("utf-8"),
-        headers={
-            "Title": title,
-            "Priority": "high",
-            "Tags": "chart_with_upwards_trend",
-        },
-        timeout=30,
+
+    emoji = {
+
+        "ALZA": "🔴",
+
+        "RECORTE": "🟢",
+
+        "MANTENER": "⚪"
+    }.get(
+        direction,
+        "⚪"
     )
 
-    print("")
-    print("=" * 70)
-    print("RESPUESTA NTFY")
-    print("=" * 70)
 
-    print(
-        f"HTTP: {response.status_code}"
+    title =
+        f"{emoji} CME FedWatch — {direction}"
+
+
+    message = (
+        f"{direction}: {probability:.1f}%\n"
+        f"Reunión: {meeting_date}\n\n"
+        f"🔴 ALZA: {values['ALZA']:.1f}%\n"
+        f"🟢 RECORTE: {values['RECORTE']:.1f}%\n"
+        f"⚪ MANTENER: {values['MANTENER']:.1f}%\n\n"
+        f"Motivo: {reason}\n"
+        f"Fuente: CME FedWatch / QuikStrike"
     )
 
-    print(
-        response.text[:500]
-    )
-
-    print("=" * 70)
-
-    response.raise_for_status()
-
-    print("NTFY: NOTIFICACIÓN ENVIADA.")
-
-
-# ============================================================
-# ESTADO
-# ============================================================
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return None
 
     try:
 
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as file:
+        response =
+            requests.post(
 
-            return json.load(file)
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+
+                data=message.encode(
+                    "utf-8"
+                ),
+
+                headers={
+                    "Title": title,
+                    "Priority": "high",
+                    "Tags": "chart_with_upwards_trend"
+                },
+
+                timeout=20
+            )
+
+
+        if response.status_code >= 200 and response.status_code < 300:
+
+            print(
+                "✓ Notificación enviada a ntfy."
+            )
+
+            return True
+
+
+        print(
+            f"ERROR ntfy: "
+            f"{response.status_code}"
+        )
+
+        print(
+            response.text
+        )
+
+        return False
+
 
     except Exception as error:
 
         print(
-            f"ERROR leyendo estado: {error}"
+            f"ERROR enviando ntfy: {error}"
         )
 
-        return None
-
-
-def save_state(
-    event,
-    probability,
-    rate,
-    meeting_date,
-):
-
-    data = {
-        "event": event,
-        "value": round(
-            float(probability),
-            1,
-        ),
-        "rate": rate,
-        "meeting_date": meeting_date,
-    }
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8",
-    ) as file:
-
-        json.dump(
-            data,
-            file,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    print("")
-    print(
-        "Estado guardado correctamente."
-    )
-
-
-# ============================================================
-# DIRECCIÓN
-# ============================================================
-
-def determine_direction(
-    current_target,
-    target_rate,
-):
-
-    try:
-
-        current_low = float(
-            current_target.split("-")[0]
-            .replace("%", "")
-        )
-
-        target_low = float(
-            target_rate.split("-")[0]
-            .replace("%", "")
-        )
-
-        if target_low > current_low:
-
-            return "ALZA"
-
-        if target_low < current_low:
-
-            return "RECORTE"
-
-        return "MANTENER"
-
-    except Exception:
-
-        return "CAMBIO"
-
-
-# ============================================================
-# OBTENER FEDWATCH
-# ============================================================
-
-def get_fedwatch():
-
-    print("")
-    print("=" * 70)
-    print("CONSULTANDO CME FEDWATCH")
-    print("=" * 70)
-
-    print("")
-    print(
-        "Fuente: CME Fed Funds futures"
-    )
-
-    # --------------------------------------------------------
-    # Pedimos la próxima reunión
-    # --------------------------------------------------------
-
-    data = get_probabilities("next")
-
-    print("")
-    print(
-        "Datos recibidos correctamente."
-    )
-
-    print("")
-    print(
-        f"Estructura recibida: "
-        f"{type(data).__name__}"
-    )
-
-    # --------------------------------------------------------
-    # Datos generales
-    # --------------------------------------------------------
-
-    current_target = data.get(
-        "current_target"
-    )
-
-    effr = data.get(
-        "effr"
-    )
-
-    meetings = data.get(
-        "meetings",
-        []
-    )
-
-    print("")
-    print(
-        f"EFFR: {effr}"
-    )
-
-    print(
-        f"Tasa objetivo actual: "
-        f"{current_target}"
-    )
-
-    print(
-        f"Reuniones encontradas: "
-        f"{len(meetings)}"
-    )
-
-    if not meetings:
-
-        raise RuntimeError(
-            "No se encontraron reuniones FedWatch."
-        )
-
-    # --------------------------------------------------------
-    # Primera reunión = próxima reunión
-    # --------------------------------------------------------
-
-    meeting = meetings[0]
-
-    meeting_date = str(
-        meeting.get("date")
-    )
-
-    probabilities = meeting.get(
-        "probabilities",
-        {}
-    )
-
-    if not probabilities:
-
-        raise RuntimeError(
-            "La próxima reunión no contiene probabilidades."
-        )
-
-    print("")
-    print("=" * 70)
-    print("PROBABILIDADES DETECTADAS")
-    print("=" * 70)
-
-    for rate, probability in probabilities.items():
-
-        print(
-            f"{rate} -> "
-            f"{float(probability):.1f}%"
-        )
-
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # Encontrar la probabilidad más alta
-    # --------------------------------------------------------
-
-    best_rate = max(
-        probabilities,
-        key=lambda rate:
-            float(probabilities[rate]),
-    )
-
-    best_probability = float(
-        probabilities[best_rate]
-    )
-
-    event = determine_direction(
-        current_target,
-        best_rate,
-    )
-
-    return {
-
-        "meeting_date":
-            meeting_date,
-
-        "current_target":
-            current_target,
-
-        "effr":
-            effr,
-
-        "event":
-            event,
-
-        "rate":
-            best_rate,
-
-        "probability":
-            best_probability,
-
-        "probabilities":
-            probabilities,
-
-    }
-
-
-# ============================================================
-# MONITOR
-# ============================================================
-
-def check_fedwatch():
-
-    print("")
-    print("=" * 70)
-    print("CME FEDWATCH MONITOR")
-    print("=" * 70)
-
-    data = get_fedwatch()
-
-    meeting_date = data[
-        "meeting_date"
-    ]
-
-    current_target = data[
-        "current_target"
-    ]
-
-    event = data[
-        "event"
-    ]
-
-    rate = data[
-        "rate"
-    ]
-
-    probability = float(
-        data["probability"]
-    )
-
-    # --------------------------------------------------------
-    # RESULTADO
-    # --------------------------------------------------------
-
-    print("")
-    print("=" * 70)
-    print("RESULTADO ACTUAL")
-    print("=" * 70)
-
-    print(
-        f"Próxima reunión: "
-        f"{meeting_date}"
-    )
-
-    print(
-        f"Tasa actual: "
-        f"{current_target}"
-    )
-
-    print(
-        f"Dirección: "
-        f"{event}"
-    )
-
-    print(
-        f"Objetivo: "
-        f"{rate}"
-    )
-
-    print(
-        f"Probabilidad: "
-        f"{probability:.1f}%"
-    )
-
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # ¿SUPERÓ 65%?
-    # --------------------------------------------------------
-
-    if probability < UMBRAL_ALERTA:
-
-        print("")
-        print(
-            f"NO HAY ALERTA."
-        )
-
-        print(
-            f"{probability:.1f}% "
-            f"< "
-            f"{UMBRAL_ALERTA:.1f}%"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ESTADO ANTERIOR
-    # --------------------------------------------------------
-
-    previous = load_state()
-
-    if previous is None:
-
-        previous_event = None
-        previous_probability = 0.0
-        previous_rate = None
-        previous_meeting = None
-
-    else:
-
-        previous_event = previous.get(
-            "event"
-        )
-
-        previous_probability = float(
-            previous.get(
-                "value",
-                0,
-            )
-        )
-
-        previous_rate = previous.get(
-            "rate"
-        )
-
-        previous_meeting = previous.get(
-            "meeting_date"
-        )
-
-    print("")
-    print("=" * 70)
-    print("ESTADO ANTERIOR")
-    print("=" * 70)
-
-    print(
-        f"Dirección: "
-        f"{previous_event}"
-    )
-
-    print(
-        f"Probabilidad: "
-        f"{previous_probability:.1f}%"
-    )
-
-    print(
-        f"Objetivo: "
-        f"{previous_rate}"
-    )
-
-    print(
-        f"Reunión: "
-        f"{previous_meeting}"
-    )
-
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # DECIDIR ALERTA
-    # --------------------------------------------------------
-
-    send_alert = False
-
-    reason = ""
-
-    # Primera señal
-    if previous_event is None:
-
-        send_alert = True
-
-        reason = (
-            "Primera señal >= 65%."
-        )
-
-    # Cambió reunión
-    elif (
-        previous_meeting
-        and
-        meeting_date != previous_meeting
-    ):
-
-        send_alert = True
-
-        reason = (
-            "Cambió la próxima reunión."
-        )
-
-    # Cambió dirección
-    elif event != previous_event:
-
-        send_alert = True
-
-        reason = (
-            f"Cambio de dirección: "
-            f"{previous_event} -> {event}"
-        )
-
-    # Cambió 10 puntos
-    elif (
-        abs(
-            probability
-            - previous_probability
-        )
-        >= DELTA_MINIMO_CAMBIO
-    ):
-
-        send_alert = True
-
-        reason = (
-            f"Cambio de "
-            f"{abs(probability - previous_probability):.1f} "
-            f"puntos porcentuales."
-        )
-
-    # --------------------------------------------------------
-    # NO ALERTA
-    # --------------------------------------------------------
-
-    if not send_alert:
-
-        print("")
-        print("=" * 70)
-        print("SIN CAMBIO SIGNIFICATIVO")
-        print("=" * 70)
-
-        print(
-            f"Anterior: "
-            f"{previous_probability:.1f}%"
-        )
-
-        print(
-            f"Actual: "
-            f"{probability:.1f}%"
-        )
-
-        print(
-            f"Cambio: "
-            f"{probability - previous_probability:+.1f} puntos"
-        )
-
-        print(
-            f"Se necesitan: "
-            f"{DELTA_MINIMO_CAMBIO:.1f} puntos"
-        )
-
-        print("=" * 70)
-
-        return
-
-    # --------------------------------------------------------
-    # ICONO
-    # --------------------------------------------------------
-
-    if event == "ALZA":
-
-        icon = "🔴"
-
-    elif event == "RECORTE":
-
-        icon = "🟢"
-
-    else:
-
-        icon = "⚪"
-
-    # --------------------------------------------------------
-    # MENSAJE
-    # --------------------------------------------------------
-
-    title = (
-        f"FEDWATCH > "
-        f"{UMBRAL_ALERTA:.0f}% - "
-        f"{event}"
-    )
-
-    message = (
-
-        "CME FEDWATCH\n\n"
-
-        f"Proxima reunion: "
-        f"{meeting_date}\n\n"
-
-        f"Tasa actual: "
-        f"{current_target}\n\n"
-
-        f"{icon} {event}\n\n"
-
-        f"Objetivo: "
-        f"{rate}\n"
-
-        f"Probabilidad: "
-        f"{probability:.1f}%\n\n"
-
-        f"Anterior: "
-        f"{previous_probability:.1f}%\n"
-
-        f"Cambio: "
-        f"{probability - previous_probability:+.1f} puntos\n\n"
-
-        f"Motivo: "
-        f"{reason}\n\n"
-
-        f"Umbral: "
-        f"{UMBRAL_ALERTA:.0f}%\n"
-
-        f"Minimo cambio: "
-        f"{DELTA_MINIMO_CAMBIO:.0f} puntos"
-
-    )
-
-    print("")
-    print("=" * 70)
-    print("ALERTA")
-    print("=" * 70)
-
-    print(message)
-
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # ENVIAR
-    # --------------------------------------------------------
-
-    print("")
-    print(
-        "Enviando alerta ntfy..."
-    )
-
-    send_ntfy(
-        title,
-        message,
-    )
-
-    # --------------------------------------------------------
-    # GUARDAR ESTADO
-    # --------------------------------------------------------
-
-    save_state(
-        event,
-        probability,
-        rate,
-        meeting_date,
-    )
-
-    print("")
-    print("=" * 70)
-    print("ALERTA ENVIADA CORRECTAMENTE")
-    print("=" * 70)
+        return False
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+def main():
 
-    print("")
-    print("=" * 70)
-    print("INICIANDO FEDWATCH.PY")
-    print("=" * 70)
+    print()
+    print(
+        "============================================================"
+    )
+    print(
+        "CME FEDWATCH MONITOR"
+    )
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Umbral: {THRESHOLD}%"
+    )
+
+    print(
+        f"Cambio para alerta: {CHANGE_ALERT} puntos"
+    )
+
+    print(
+        f"Hora UTC: "
+        f"{datetime.now(timezone.utc).isoformat()}"
+    )
+
+
+    # --------------------------------------------------------
+    # SCRAPE
+    # --------------------------------------------------------
+
+    meetings =
+        scrape_fedwatch()
+
+
+    # --------------------------------------------------------
+    # PRÓXIMA REUNIÓN
+    # --------------------------------------------------------
+
+    next_meeting =
+        get_next_meeting(
+            meetings
+        )
+
+
+    if not next_meeting:
+
+        raise RuntimeError(
+            "No se encontró la próxima reunión FOMC."
+        )
+
+
+    meeting_date =
+        next_meeting[
+            "meeting_date"
+        ]
+
+    summary =
+        next_meeting[
+            "summary"
+        ]
+
+
+    # --------------------------------------------------------
+    # SEÑAL
+    # --------------------------------------------------------
+
+    direction, probability, values =
+        determine_signal(
+            summary
+        )
+
+
+    print()
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"PRÓXIMA REUNIÓN: {meeting_date}"
+    )
+
+    print(
+        f"🔴 ALZA: {values['ALZA']:.1f}%"
+    )
+
+    print(
+        f"🟢 RECORTE: {values['RECORTE']:.1f}%"
+    )
+
+    print(
+        f"⚪ MANTENER: {values['MANTENER']:.1f}%"
+    )
+
+    print(
+        f"SEÑAL PRINCIPAL: {direction} "
+        f"{probability:.1f}%"
+    )
+
+    print(
+        "============================================================"
+    )
+
+
+    # --------------------------------------------------------
+    # ESTADO ANTERIOR
+    # --------------------------------------------------------
+
+    state =
+        load_state()
+
+
+    alert, reason =
+        should_alert(
+            state,
+            meeting_date,
+            direction,
+            probability
+        )
+
+
+    print(
+        f"Alerta: {'SÍ' if alert else 'NO'}"
+    )
+
+    print(
+        f"Motivo: {reason}"
+    )
+
+
+    # --------------------------------------------------------
+    # ENVIAR ALERTA
+    # --------------------------------------------------------
+
+    if alert:
+
+        send_ntfy(
+            direction,
+            probability,
+            meeting_date,
+            values,
+            reason
+        )
+
+
+        # Guardamos solamente el último estado
+        # que produjo una alerta.
+        #
+        # Así NO se generan notificaciones cada
+        # 15 minutos mientras el dato permanezca igual.
+
+        state = {
+
+            "meeting_date":
+                meeting_date,
+
+            "direction":
+                direction,
+
+            "probability":
+                probability,
+
+            "updated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+        }
+
+
+        save_state(
+            state
+        )
+
+        print(
+            "✓ Estado actualizado."
+        )
+
+
+    else:
+
+        print(
+            "No se envía notificación."
+        )
+
+
+    print()
+    print(
+        "Proceso terminado correctamente."
+    )
+
+
+if __name__ == "__main__":
 
     try:
 
-        check_fedwatch()
+        main()
 
     except Exception as error:
 
-        print("")
-        print("=" * 70)
-        print("ERROR FATAL")
-        print("=" * 70)
-
+        print()
         print(
-            repr(error)
+            "============================================================"
         )
 
-        print("=" * 70)
+        print(
+            "ERROR"
+        )
 
-        raise
+        print(
+            str(error)
+        )
+
+        print(
+            "============================================================"
+        )
+
+        sys.exit(1)
