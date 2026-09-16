@@ -1,150 +1,39 @@
 name: CME FedWatch Monitor
-
 on:
-
-  # Ejecutar automáticamente cada 15 minutos
   schedule:
-    - cron: "*/15 * * * *"
-
-  # Permite ejecutarlo manualmente desde GitHub
+    - cron: '*/15 * * * *'
   workflow_dispatch:
-
-
-# Necesario para poder guardar fedwatch_state.json
 permissions:
   contents: write
-
-
 jobs:
-
-  fedwatch:
-
+  monitor:
     runs-on: ubuntu-latest
-
-
+    timeout-minutes: 6
     steps:
-
-      # ======================================================
-      # 1. DESCARGAR EL REPOSITORIO
-      # ======================================================
-
-      - name: Descargar repositorio
-
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-
-
-      # ======================================================
-      # 2. PYTHON
-      # ======================================================
-
-      - name: Instalar Python
-
-        uses: actions/setup-python@v5
-
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-
-      # ======================================================
-      # 3. DEPENDENCIAS DEL SISTEMA
-      # ======================================================
-
-      - name: Instalar dependencias Linux
-
+          python-version: '3.12'
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y xvfb curl
+      - name: Install Playwright
         run: |
-
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            xvfb \
-            xfonts-100dpi \
-            xfonts-75dpi \
-            xfonts-scalable \
-            xfonts-cyrillic
-
-
-      # ======================================================
-      # 4. DEPENDENCIAS PYTHON
-      # ======================================================
-
-      - name: Instalar dependencias Python
-
-        run: |
-
           python -m pip install --upgrade pip
-
-          pip install \
-            playwright \
-            requests
-
-
-      # ======================================================
-      # 5. INSTALAR CHROMIUM
-      # ======================================================
-
-      - name: Instalar Chromium de Playwright
-
-        run: |
-
-          python -m playwright install chromium
-
-          python -m playwright install-deps chromium
-
-
-      # ======================================================
-      # 6. EJECUTAR FEDWATCH
-      # ======================================================
-
-      - name: Ejecutar monitor CME FedWatch
-
+          python -m pip install 'playwright>=1.40.0'
+          python -m playwright install --with-deps chromium
+      - name: Run monitor
         env:
-
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-
+        run: xvfb-run -a -s '-screen 0 1920x1080x24' python fedwatch.py
+      - name: Save state
+        if: always()
         run: |
-
-          xvfb-run \
-            -a \
-            --server-args="-screen 0 1920x1080x24" \
-            python fedwatch.py
-
-
-      # ======================================================
-      # 7. GUARDAR ESTADO
-      # ======================================================
-
-      - name: Guardar estado de FedWatch
-
-        run: |
-
           if [ -f fedwatch_state.json ]; then
-
-            git config user.name \
-              "github-actions[bot]"
-
-            git config user.email \
-              "41898282+github-actions[bot]@users.noreply.github.com"
-
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add fedwatch_state.json
-
-            if git diff --cached --quiet; then
-
-              echo "No hay cambios de estado."
-
-            else
-
-              git commit \
-                -m "chore: update FedWatch alert state"
-
-              git push
-
-            fi
-
-          else
-
-            echo "No se creó archivo de estado."
-
+            git diff --cached --quiet || git commit -m 'Update FedWatch state'
+            git push
           fi
