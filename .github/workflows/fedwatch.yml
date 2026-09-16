@@ -1,161 +1,104 @@
-name: FedWatch Monitor
+name: CME FedWatch Monitor
 
 on:
 
+  # Ejecutar automáticamente cada 15 minutos
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # Permite ejecutarlo manualmente desde GitHub
   workflow_dispatch:
 
-  schedule:
 
-    - cron: "*/15 * * * *"
+# Necesario para poder guardar fedwatch_state.json
+permissions:
+  contents: write
 
 
 jobs:
 
-  monitor:
+  fedwatch:
 
     runs-on: ubuntu-latest
+
 
     steps:
 
       # ======================================================
-      # DESCARGAR REPOSITORIO
+      # 1. DESCARGAR EL REPOSITORIO
       # ======================================================
 
-      - name: Descargar código
+      - name: Descargar repositorio
 
         uses: actions/checkout@v4
 
+        with:
+          fetch-depth: 1
+
 
       # ======================================================
-      # PYTHON
+      # 2. PYTHON
       # ======================================================
 
-      - name: Configurar Python
+      - name: Instalar Python
 
         uses: actions/setup-python@v5
 
         with:
-
           python-version: "3.12"
 
 
       # ======================================================
-      # RESTAURAR ESTADO
+      # 3. DEPENDENCIAS DEL SISTEMA
       # ======================================================
 
-      - name: Restaurar estado FedWatch
-
-        uses: actions/cache/restore@v4
-
-        with:
-
-          path: last_state.json
-
-          key: fedwatch-state-${{ github.run_id }}
-
-          restore-keys: |
-            fedwatch-state-
-
-
-      # ======================================================
-      # CREAR ESTADO SI NO EXISTE
-      # ======================================================
-
-      - name: Preparar estado
+      - name: Instalar dependencias Linux
 
         run: |
 
-          echo ""
-          echo "=========================================="
-          echo "PREPARANDO ESTADO"
-          echo "=========================================="
+          sudo apt-get update
 
-          if [ ! -f last_state.json ]; then
-
-            echo '{"event":null,"value":0,"rate":null,"meeting_date":null}' > last_state.json
-
-          fi
-
-          echo ""
-          echo "Estado:"
-          cat last_state.json
-
-          echo ""
-          echo "=========================================="
+          sudo apt-get install -y \
+            xvfb \
+            xfonts-100dpi \
+            xfonts-75dpi \
+            xfonts-scalable \
+            xfonts-cyrillic
 
 
       # ======================================================
-      # INSTALAR DEPENDENCIAS
+      # 4. DEPENDENCIAS PYTHON
       # ======================================================
 
-      - name: Instalar dependencias
+      - name: Instalar dependencias Python
 
         run: |
 
           python -m pip install --upgrade pip
 
-          pip install requests
-
-          pip install cme-fedwatch
+          pip install \
+            playwright \
+            requests
 
 
       # ======================================================
-      # VERIFICAR INSTALACIÓN
+      # 5. INSTALAR CHROMIUM
       # ======================================================
 
-      - name: Verificar FedWatch
+      - name: Instalar Chromium de Playwright
 
         run: |
 
-          echo ""
-          echo "=========================================="
-          echo "VERIFICANDO CME FEDWATCH"
-          echo "=========================================="
+          python -m playwright install chromium
 
-          python -c "import cme_fedwatch; print('cme-fedwatch instalado correctamente')"
-
-          echo ""
-          python -c "import requests; print('requests instalado correctamente')"
-
-          echo ""
-          echo "=========================================="
+          python -m playwright install-deps chromium
 
 
       # ======================================================
-      # VERIFICAR ARCHIVO
+      # 6. EJECUTAR FEDWATCH
       # ======================================================
 
-      - name: Verificar fedwatch.py
-
-        run: |
-
-          echo ""
-          echo "=========================================="
-          echo "VERIFICANDO fedwatch.py"
-          echo "=========================================="
-
-          pwd
-
-          echo ""
-
-          ls -lah
-
-          echo ""
-
-          echo "Cantidad de líneas:"
-
-          wc -l fedwatch.py
-
-          echo ""
-
-          echo "=========================================="
-
-
-      # ======================================================
-      # EJECUTAR FEDWATCH
-      # ======================================================
-
-      - name: Ejecutar FedWatch
+      - name: Ejecutar monitor CME FedWatch
 
         env:
 
@@ -163,81 +106,45 @@ jobs:
 
         run: |
 
-          echo ""
-          echo "=========================================="
-          echo "EJECUTANDO FEDWATCH"
-          echo "=========================================="
-
-          python -u fedwatch.py
-
-          echo ""
-          echo "=========================================="
-          echo "FEDWATCH TERMINÓ"
-          echo "=========================================="
+          xvfb-run \
+            -a \
+            --server-args="-screen 0 1920x1080x24" \
+            python fedwatch.py
 
 
       # ======================================================
-      # MOSTRAR ESTADO FINAL
+      # 7. GUARDAR ESTADO
       # ======================================================
 
-      - name: Mostrar estado final
-
-        if: always()
+      - name: Guardar estado de FedWatch
 
         run: |
 
-          echo ""
-          echo "=========================================="
-          echo "ESTADO FINAL"
-          echo "=========================================="
+          if [ -f fedwatch_state.json ]; then
 
-          if [ -f last_state.json ]; then
+            git config user.name \
+              "github-actions[bot]"
 
-            cat last_state.json
+            git config user.email \
+              "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add fedwatch_state.json
+
+            if git diff --cached --quiet; then
+
+              echo "No hay cambios de estado."
+
+            else
+
+              git commit \
+                -m "chore: update FedWatch alert state"
+
+              git push
+
+            fi
 
           else
 
-            echo "No existe last_state.json"
+            echo "No se creó archivo de estado."
 
           fi
-
-          echo ""
-          echo "=========================================="
-
-
-      # ======================================================
-      # GUARDAR ESTADO
-      # ======================================================
-
-      - name: Guardar estado FedWatch
-
-        if: success()
-
-        uses: actions/cache/save@v4
-
-        with:
-
-          path: last_state.json
-
-          key: fedwatch-state-${{ github.run_id }}
-
-
-      # ======================================================
-      # GUARDAR DIAGNÓSTICO
-      # ======================================================
-
-      - name: Guardar diagnóstico
-
-        if: always()
-
-        uses: actions/upload-artifact@v4
-
-        with:
-
-          name: fedwatch-debug-${{ github.run_id }}
-
-          path: |
-
-            last_state.json
-
-          if-no-files-found: ignore
