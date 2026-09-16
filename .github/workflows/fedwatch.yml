@@ -6,7 +6,6 @@ on:
 
   schedule:
 
-    # Cada 15 minutos
     - cron: "*/15 * * * *"
 
 
@@ -41,7 +40,7 @@ jobs:
 
 
       # ======================================================
-      # RESTAURAR ESTADO ANTERIOR
+      # RESTAURAR ESTADO
       # ======================================================
 
       - name: Restaurar estado FedWatch
@@ -59,22 +58,24 @@ jobs:
 
 
       # ======================================================
-      # CREAR ESTADO INICIAL
+      # PREPARAR ESTADO
       # ======================================================
 
       - name: Preparar estado
 
         run: |
 
+          echo ""
+          echo "=========================================="
+          echo "PREPARANDO ESTADO"
+          echo "=========================================="
+
           if [ ! -f last_state.json ]; then
             echo '{"event":null,"value":0,"rate":null,"meeting_date":null}' > last_state.json
           fi
 
           echo ""
-          echo "=========================================="
-          echo "ESTADO ANTERIOR"
-          echo "=========================================="
-
+          echo "Estado actual:"
           cat last_state.json
 
           echo ""
@@ -108,6 +109,39 @@ jobs:
 
 
       # ======================================================
+      # VERIFICAR ARCHIVO
+      # ======================================================
+
+      - name: Verificar fedwatch.py
+
+        run: |
+
+          echo ""
+          echo "=========================================="
+          echo "VERIFICANDO fedwatch.py"
+          echo "=========================================="
+
+          echo ""
+          echo "Directorio:"
+          pwd
+
+          echo ""
+          echo "Archivos:"
+          ls -lah
+
+          echo ""
+          echo "Líneas de fedwatch.py:"
+          wc -l fedwatch.py
+
+          echo ""
+          echo "Primeras 10 líneas:"
+          head -10 fedwatch.py
+
+          echo ""
+          echo "=========================================="
+
+
+      # ======================================================
       # EJECUTAR FEDWATCH
       # ======================================================
 
@@ -119,7 +153,17 @@ jobs:
 
         run: |
 
-          python fedwatch.py
+          echo ""
+          echo "=========================================="
+          echo "EJECUTANDO FEDWATCH"
+          echo "=========================================="
+
+          python -u fedwatch.py
+
+          echo ""
+          echo "=========================================="
+          echo "FEDWATCH TERMINÓ"
+          echo "=========================================="
 
 
       # ======================================================
@@ -165,7 +209,7 @@ jobs:
 
 
       # ======================================================
-      # GUARDAR ARCHIVO DE DEBUG SI FALLA
+      # GUARDAR DIAGNÓSTICO
       # ======================================================
 
       - name: Guardar diagnóstico CME
@@ -181,6 +225,7 @@ jobs:
           path: |
 
             cme_debug.txt
+            cme_error.png
             last_state.json
 
           if-no-files-found: ignore
