@@ -58,7 +58,7 @@ jobs:
 
 
       # ======================================================
-      # PREPARAR ESTADO
+      # CREAR ESTADO SI NO EXISTE
       # ======================================================
 
       - name: Preparar estado
@@ -71,11 +71,13 @@ jobs:
           echo "=========================================="
 
           if [ ! -f last_state.json ]; then
+
             echo '{"event":null,"value":0,"rate":null,"meeting_date":null}' > last_state.json
+
           fi
 
           echo ""
-          echo "Estado actual:"
+          echo "Estado:"
           cat last_state.json
 
           echo ""
@@ -92,20 +94,31 @@ jobs:
 
           python -m pip install --upgrade pip
 
-          pip install requests playwright
+          pip install requests
+
+          pip install cme-fedwatch
 
 
       # ======================================================
-      # INSTALAR CHROMIUM
+      # VERIFICAR INSTALACIÓN
       # ======================================================
 
-      - name: Instalar navegador Chromium
+      - name: Verificar FedWatch
 
         run: |
 
-          python -m playwright install chromium
+          echo ""
+          echo "=========================================="
+          echo "VERIFICANDO CME FEDWATCH"
+          echo "=========================================="
 
-          python -m playwright install-deps chromium
+          python -c "import cme_fedwatch; print('cme-fedwatch instalado correctamente')"
+
+          echo ""
+          python -c "import requests; print('requests instalado correctamente')"
+
+          echo ""
+          echo "=========================================="
 
 
       # ======================================================
@@ -121,23 +134,20 @@ jobs:
           echo "VERIFICANDO fedwatch.py"
           echo "=========================================="
 
-          echo ""
-          echo "Directorio:"
           pwd
 
           echo ""
-          echo "Archivos:"
+
           ls -lah
 
           echo ""
-          echo "Líneas de fedwatch.py:"
+
+          echo "Cantidad de líneas:"
+
           wc -l fedwatch.py
 
           echo ""
-          echo "Primeras 10 líneas:"
-          head -10 fedwatch.py
 
-          echo ""
           echo "=========================================="
 
 
@@ -182,9 +192,13 @@ jobs:
           echo "=========================================="
 
           if [ -f last_state.json ]; then
+
             cat last_state.json
+
           else
+
             echo "No existe last_state.json"
+
           fi
 
           echo ""
@@ -212,7 +226,7 @@ jobs:
       # GUARDAR DIAGNÓSTICO
       # ======================================================
 
-      - name: Guardar diagnóstico CME
+      - name: Guardar diagnóstico
 
         if: always()
 
@@ -224,8 +238,6 @@ jobs:
 
           path: |
 
-            cme_debug.txt
-            cme_error.png
             last_state.json
 
           if-no-files-found: ignore
