@@ -66,8 +66,7 @@ def parse_date(text):
 
     text = text.strip()
 
-    # Ejemplo:
-    # 16 9月 2026
+    # Ejemplo: 16 9月 2026
     match = re.search(
         r"(\d{1,2})\s*(\d{1,2})月\s*(\d{4})",
         text
@@ -80,8 +79,7 @@ def parse_date(text):
 
         return f"{year:04d}-{month:02d}-{day:02d}"
 
-    # Ejemplo:
-    # 16 Sep 2026
+    # Ejemplo: 16 Sep 2026
     match = re.search(
         r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})",
         text
@@ -111,14 +109,23 @@ def load_state():
         return {}
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
             return json.load(f)
+
     except Exception:
         return {}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(
             state,
             f,
@@ -128,7 +135,7 @@ def save_state(state):
 
 
 # ============================================================
-# EXTRACCIÓN DEL DOM DE QUIKSTRIKE
+# EXTRACCIÓN DEL DOM
 # ============================================================
 
 def extract_meeting_from_dom(frame):
@@ -136,21 +143,20 @@ def extract_meeting_from_dom(frame):
     javascript = r"""
     () => {
 
-        function findInnerTable(keyword) {
+        function findTable(keyword) {
 
             const tables =
-                document.querySelectorAll("table.grid-thm");
+                document.querySelectorAll("table");
 
             for (const table of tables) {
 
                 const text =
-                    Array.from(
-                        table.querySelectorAll("th, td")
-                    )
-                    .map(el => el.textContent.trim())
-                    .join(" ");
+                    table.innerText || "";
 
-                if (text.includes(keyword)) {
+                if (
+                    text.toLowerCase()
+                    .includes(keyword.toLowerCase())
+                ) {
                     return table;
                 }
             }
@@ -159,193 +165,218 @@ def extract_meeting_from_dom(frame):
         }
 
 
-        function parsePct(value) {
+        function pct(value) {
 
             if (!value) {
                 return 0;
             }
 
-            const cleaned =
+            const match =
                 value
                     .toString()
-                    .replace(/[%<>≈\u200b]/g, "")
-                    .trim();
+                    .replace(/,/g, "")
+                    .match(/([\d.]+)\s*%?/);
 
-            const match =
-                cleaned.match(/([\d.]+)/);
+            if (!match) {
+                return 0;
+            }
 
-            return match
-                ? parseFloat(match[1])
-                : 0;
+            return parseFloat(match[1]);
         }
 
 
         const result = {
+
             meeting_date: "",
-            contract: "",
-            expires: "",
-            mid_price: "",
+
             current_target: "",
-            summary: {},
+
+            summary: {
+
+                ease: 0,
+
+                no_change: 0,
+
+                hike: 0
+            },
+
             table: []
         };
 
 
-        // ----------------------------------------------------
-        // INFORMACIÓN DE LA REUNIÓN
-        // ----------------------------------------------------
+        // ====================================================
+        // TEXTO COMPLETO
+        // ====================================================
 
-        const infoTable =
-            findInnerTable("Meeting Date");
+        const bodyText =
+            document.body
+                ? document.body.innerText
+                : "";
 
-        if (infoTable) {
 
-            const cells =
-                infoTable.querySelectorAll("td");
+        // ====================================================
+        // FECHA DE REUNIÓN
+        // ====================================================
 
-            if (cells.length >= 4) {
+        let match =
+            bodyText.match(
+                /Meeting Date[\s\S]{0,150}?(\d{1,2}[\s,\/-]+\w+[\s,\/-]+\d{4})/i
+            );
+
+        if (match) {
+
+            result.meeting_date =
+                match[1].trim();
+        }
+
+
+        // Formato chino
+        if (!result.meeting_date) {
+
+            match =
+                bodyText.match(
+                    /(\d{1,2}\s*\d{1,2}月\s*\d{4})/
+                );
+
+            if (match) {
 
                 result.meeting_date =
-                    cells[0].textContent.trim();
-
-                result.contract =
-                    cells[1].textContent.trim();
-
-                result.expires =
-                    cells[2].textContent.trim();
-
-                result.mid_price =
-                    cells[3].textContent.trim();
+                    match[1].trim();
             }
         }
 
 
-        // ----------------------------------------------------
-        // RESUMEN:
-        // EASE / NO CHANGE / HIKE
-        // ----------------------------------------------------
+        // ====================================================
+        // CURRENT TARGET
+        // ====================================================
 
-        const probabilityTable =
-            findInnerTable("Probabilities");
+        match =
+            bodyText.match(
+                /Current target rate is\s+(\d+-\d+)/i
+            );
 
-        if (probabilityTable) {
+        if (match) {
 
-            const rows =
-                probabilityTable.querySelectorAll("tr");
+            result.current_target =
+                match[1];
+        }
 
-            for (const row of rows) {
 
-                const cells =
-                    row.querySelectorAll("td");
+        // ====================================================
+        // BUSCAR PROBABILIDADES
+        // ====================================================
 
-                if (cells.length >= 3) {
+        const tables =
+            document.querySelectorAll("table");
+
+
+        for (const table of tables) {
+
+            const text =
+                table.innerText || "";
+
+            const upper =
+                text.toUpperCase();
+
+
+            if (
+                upper.includes("EASE") &&
+                upper.includes("NO CHANGE") &&
+                upper.includes("HIKE")
+            ) {
+
+                const percentages =
+                    text.match(
+                        /\d+(?:\.\d+)?\s*%/g
+                    ) || [];
+
+
+                if (percentages.length >= 3) {
 
                     const values =
-                        Array.from(cells)
-                        .map(c => c.textContent.trim());
+                        percentages.map(pct);
 
-                    const percentages =
-                        values
-                        .map(parsePct)
-                        .filter(v => v >= 0);
 
-                    if (percentages.length >= 3) {
+                    result.summary.ease =
+                        values[0];
 
-                        result.summary = {
+                    result.summary.no_change =
+                        values[1];
 
-                            ease: percentages[0],
-
-                            no_change:
-                                percentages[1],
-
-                            hike:
-                                percentages[2]
-                        };
-
-                        break;
-                    }
+                    result.summary.hike =
+                        values[2];
                 }
             }
         }
 
 
-        // ----------------------------------------------------
-        // TABLA DE TARGET RATES
-        // ----------------------------------------------------
+        // ====================================================
+        // TARGET RATE TABLE
+        // ====================================================
 
-        const rateTable =
-            findInnerTable("Target Rate (bps)");
-
-        if (rateTable) {
+        for (const table of tables) {
 
             const rows =
-                rateTable.querySelectorAll("tr");
+                table.querySelectorAll("tr");
+
 
             for (const row of rows) {
 
-                if (row.classList.contains("hide")) {
-                    continue;
-                }
-
                 const cells =
                     row.querySelectorAll("td");
+
 
                 if (cells.length < 2) {
                     continue;
                 }
 
-                const range =
-                    cells[0].textContent.trim();
-
-                if (!/^\d+-\d+/.test(range)) {
-                    continue;
-                }
 
                 const values =
                     Array.from(cells)
-                    .slice(1)
-                    .map(c => c.textContent.trim());
+                        .map(
+                            cell =>
+                                cell.innerText.trim()
+                        );
+
+
+                const range =
+                    values[0];
+
+
+                if (
+                    !/^\d+-\d+/.test(range)
+                ) {
+                    continue;
+                }
+
+
+                const percentages =
+                    values
+                        .slice(1)
+                        .map(pct);
+
+
+                if (!percentages.length) {
+                    continue;
+                }
+
 
                 result.table.push({
 
                     range: range,
 
                     now:
-                        parsePct(values[0]),
+                        percentages[0] || 0,
 
                     day1:
-                        parsePct(values[1]),
+                        percentages[1] || 0,
 
                     week1:
-                        parsePct(values[2]),
+                        percentages[2] || 0,
 
                     month1:
-                        parsePct(values[3])
+                        percentages[3] || 0
                 });
-            }
-        }
-
-
-        // ----------------------------------------------------
-        // TASA ACTUAL
-        // ----------------------------------------------------
-
-        const all =
-            document.querySelectorAll("*");
-
-        for (const element of all) {
-
-            const match =
-                element.textContent.match(
-                    /Current target rate is (\d+-\d+)/i
-                );
-
-            if (match) {
-
-                result.current_target =
-                    match[1];
-
-                break;
             }
         }
 
@@ -355,27 +386,48 @@ def extract_meeting_from_dom(frame):
     """
 
     try:
-        return frame.evaluate(javascript)
-    except Exception:
+
+        return frame.evaluate(
+            javascript
+        )
+
+    except Exception as error:
+
+        print(
+            f"Error extrayendo DOM: {error}"
+        )
+
         return None
 
 
 # ============================================================
-# TEXTO COMO RESPALDO
+# RESPALDO: EXTRAER DESDE TEXTO
 # ============================================================
 
 def extract_from_text(text):
 
     result = {
+
         "meeting_date": "",
+
         "current_target": "",
-        "summary": {},
+
+        "summary": {
+
+            "ease": 0,
+
+            "no_change": 0,
+
+            "hike": 0
+        },
+
         "table": []
     }
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # FECHA
-    # --------------------------------------------------------
+    # ========================================================
 
     match = re.search(
         r"(\d{1,2}\s*\d{1,2}月\s*\d{4})",
@@ -383,8 +435,11 @@ def extract_from_text(text):
     )
 
     if match:
-        result["meeting_date"] =
-            parse_date(match.group(1))
+
+        result["meeting_date"] = parse_date(
+            match.group(1)
+        )
+
 
     if not result["meeting_date"]:
 
@@ -394,13 +449,15 @@ def extract_from_text(text):
         )
 
         if match:
-            result["meeting_date"] =
-                parse_date(match.group(1))
+
+            result["meeting_date"] = parse_date(
+                match.group(1)
+            )
 
 
-    # --------------------------------------------------------
-    # CURRENT TARGET RATE
-    # --------------------------------------------------------
+    # ========================================================
+    # CURRENT TARGET
+    # ========================================================
 
     match = re.search(
         r"Current target rate is\s+(\d+-\d+)",
@@ -409,15 +466,16 @@ def extract_from_text(text):
     )
 
     if match:
-        result["current_target"] =
-            match.group(1)
+
+        result["current_target"] = match.group(1)
 
 
-    # --------------------------------------------------------
-    # EASE / NO CHANGE / HIKE
-    # --------------------------------------------------------
+    # ========================================================
+    # PROBABILIDADES
+    # ========================================================
 
     lines = text.splitlines()
+
 
     for index, line in enumerate(lines):
 
@@ -428,13 +486,14 @@ def extract_from_text(text):
         ):
 
             for next_line in lines[
-                index + 1:index + 5
+                index + 1:index + 6
             ]:
 
                 values = re.findall(
                     r"([\d.]+)\s*%",
                     next_line
                 )
+
 
                 if len(values) >= 3:
 
@@ -455,82 +514,11 @@ def extract_from_text(text):
             break
 
 
-    # --------------------------------------------------------
-    # TARGET RATE TABLE
-    # --------------------------------------------------------
-
-    found_header = False
-
-    for line in lines:
-
-        stripped = line.strip()
-
-        if (
-            "TARGET RATE" in stripped.upper()
-            and
-            "PROBABILITY" in stripped.upper()
-        ):
-
-            found_header = True
-            continue
-
-        if not found_header:
-            continue
-
-        match = re.match(
-            r"^(\d+-\d+.*?)\s+(.+)$",
-            stripped
-        )
-
-        if not match:
-            continue
-
-        rate_range = match.group(1).strip()
-
-        if not re.match(
-            r"^\d+-\d+",
-            rate_range
-        ):
-            continue
-
-        percentages = re.findall(
-            r"[\d.]+%",
-            match.group(2)
-        )
-
-        if not percentages:
-            continue
-
-        result["table"].append({
-
-            "range":
-                rate_range,
-
-            "now":
-                parse_pct(percentages[0]),
-
-            "day1":
-                parse_pct(percentages[1])
-                if len(percentages) > 1
-                else 0,
-
-            "week1":
-                parse_pct(percentages[2])
-                if len(percentages) > 2
-                else 0,
-
-            "month1":
-                parse_pct(percentages[3])
-                if len(percentages) > 3
-                else 0
-        })
-
-
     return result
 
 
 # ============================================================
-# SCRAPER PRINCIPAL
+# SCRAPER CME
 # ============================================================
 
 def scrape_fedwatch():
@@ -539,39 +527,52 @@ def scrape_fedwatch():
     print("=" * 60)
     print("CME FEDWATCH — LIVE SCRAPER")
     print("=" * 60)
-    print(f"Fuente: {CME_URL}")
+    print(
+        f"Fuente: {CME_URL}"
+    )
     print()
 
 
     with sync_playwright() as playwright:
 
-        print("Iniciando Chromium...")
-
-        browser = playwright.chromium.launch(
-            headless=False,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--window-size=1920,1080"
-            ]
+        print(
+            "Iniciando Chromium..."
         )
 
-        context = browser.new_context(
-            viewport={
-                "width": 1920,
-                "height": 1080
-            },
-            user_agent=USER_AGENT,
-            locale="en-US",
-            timezone_id="America/Chicago"
+
+        browser =
+            playwright.chromium.launch(
+                headless=False,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--window-size=1920,1080"
+                ]
+            )
+
+
+        context =
+            browser.new_context(
+                viewport={
+                    "width": 1920,
+                    "height": 1080
+                },
+                user_agent=USER_AGENT,
+                locale="en-US"
+            )
+
+
+        page =
+            context.new_page()
+
+
+        print(
+            "Abriendo CME..."
         )
 
-        page = context.new_page()
-
-        print("Abriendo CME...")
 
         try:
 
@@ -584,39 +585,55 @@ def scrape_fedwatch():
         except Exception as error:
 
             print(
-                f"Advertencia al abrir CME: {error}"
+                f"Advertencia de navegación: {error}"
             )
 
-            # La página puede seguir cargando aunque
-            # Playwright informe timeout.
-            time.sleep(10)
+            print(
+                "La página puede seguir cargando..."
+            )
 
 
-        print("Esperando QuikStrike...")
+        print(
+            "Esperando QuikStrike..."
+        )
+
 
         qs_frame = None
 
-        # Hasta 120 segundos para que QuikStrike
-        # cargue completamente.
-        for elapsed in range(0, 121, 5):
+
+        # ====================================================
+        # BUSCAR FRAME
+        # ====================================================
+
+        for elapsed in range(
+            0,
+            121,
+            5
+        ):
 
             time.sleep(5)
 
+
             print(
-                f"  Esperando... {elapsed + 5}s"
+                f"Esperando... {elapsed + 5}s"
             )
+
 
             for frame in page.frames:
 
                 try:
 
                     text =
-                        frame.locator("body").inner_text(
+                        frame.locator(
+                            "body"
+                        ).inner_text(
                             timeout=3000
                         )
 
+
                     upper =
                         text.upper()
+
 
                     if (
                         "EASE" in upper
@@ -627,7 +644,7 @@ def scrape_fedwatch():
                             "NO CHANGE" in upper
                         )
                         and
-                        len(text) > 500
+                        len(text) > 300
                     ):
 
                         qs_frame = frame
@@ -638,408 +655,136 @@ def scrape_fedwatch():
 
                         break
 
+
                 except Exception:
                     continue
+
 
             if qs_frame:
                 break
 
 
+        # ====================================================
+        # FALLBACK: PÁGINA PRINCIPAL
+        # ====================================================
+
         if not qs_frame:
 
-            print()
-            print(
-                "ERROR: CME cargó, pero "
-                "QuikStrike no apareció."
-            )
-
-            # Intentamos guardar diagnóstico
             try:
+
+                text =
+                    page.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=5000
+                    )
+
+
+                if (
+                    "EASE" in text.upper()
+                    and
+                    "HIKE" in text.upper()
+                ):
+
+                    qs_frame = page
+
+                    print(
+                        "✓ FedWatch encontrado "
+                        "en la página principal."
+                    )
+
+            except Exception:
+                pass
+
+
+        if not qs_frame:
+
+            try:
+
                 page.screenshot(
                     path="fedwatch_error.png",
                     full_page=True
                 )
+
+                print(
+                    "Se guardó fedwatch_error.png"
+                )
+
             except Exception:
                 pass
 
-            browser.close()
-
-            raise RuntimeError(
-                "QuikStrike no se pudo cargar."
-            )
-
-
-        # ----------------------------------------------------
-        # ENCONTRAR REUNIONES
-        # ----------------------------------------------------
-
-        print("Buscando reuniones FOMC...")
-
-        tabs = qs_frame.evaluate(
-            """
-            () => {
-
-                const links =
-                    document.querySelectorAll(
-                        'a[id*="lbMeeting"]'
-                    );
-
-                return Array.from(links).map(
-                    a => ({
-                        id: a.id,
-                        text: a.textContent.trim()
-                    })
-                );
-            }
-            """
-        )
-
-        if not tabs:
 
             browser.close()
 
+
             raise RuntimeError(
-                "No se encontraron las reuniones FOMC."
+                "QuikStrike/FedWatch no apareció."
             )
 
+
+        # ====================================================
+        # EXTRAER INFORMACIÓN
+        # ====================================================
 
         print(
-            f"✓ {len(tabs)} reuniones encontradas."
+            "Extrayendo información..."
         )
 
 
-        meetings = []
-
-
-        # ----------------------------------------------------
-        # LEER CADA REUNIÓN
-        # ----------------------------------------------------
-
-        previous_date = None
-
-        for index, tab in enumerate(tabs):
-
-            print(
-                f"Reunión {index + 1}/{len(tabs)}: "
-                f"{tab['text']}"
+        data =
+            extract_meeting_from_dom(
+                qs_frame
             )
 
 
-            # Fecha anterior antes del click
-            if index > 0:
+        if not data:
 
-                try:
+            try:
 
-                    previous_date =
-                        qs_frame.evaluate(
-                            """
-                            () => {
-
-                                const tables =
-                                    document.querySelectorAll(
-                                        "table.grid-thm"
-                                    );
-
-                                for (const table of tables) {
-
-                                    const text =
-                                        table.innerText;
-
-                                    if (
-                                        text.includes(
-                                            "Meeting Date"
-                                        )
-                                    ) {
-
-                                        const cells =
-                                            table.querySelectorAll(
-                                                "td"
-                                            );
-
-                                        return cells.length
-                                            ? cells[0]
-                                                .textContent
-                                                .trim()
-                                            : "";
-                                    }
-                                }
-
-                                return "";
-                            }
-                            """
-                        )
-
-                except Exception:
-                    previous_date = None
-
-
-            # ------------------------------------------------
-            # CLICK EN REUNIÓN
-            # ------------------------------------------------
-
-            clicked = qs_frame.evaluate(
-                """
-                (id) => {
-
-                    const element =
-                        document.getElementById(id);
-
-                    if (!element) {
-                        return false;
-                    }
-
-                    element.click();
-
-                    return true;
-                }
-                """,
-                tab["id"]
-            )
-
-
-            if not clicked:
-                print("  No se pudo seleccionar.")
-                continue
-
-
-            # ------------------------------------------------
-            # ESPERAR POSTBACK ASP.NET
-            # ------------------------------------------------
-
-            for _ in range(40):
-
-                time.sleep(0.3)
-
-                try:
-
-                    ready =
-                        qs_frame.evaluate(
-                            """
-                            (previousDate) => {
-
-                                const loading =
-                                    document.querySelector(
-                                        ".throbber, [class*='loading']"
-                                    );
-
-                                if (
-                                    loading &&
-                                    loading.offsetParent !== null
-                                ) {
-                                    return false;
-                                }
-
-                                if (!previousDate) {
-                                    return true;
-                                }
-
-                                const tables =
-                                    document.querySelectorAll(
-                                        "table.grid-thm"
-                                    );
-
-                                for (const table of tables) {
-
-                                    if (
-                                        table.innerText.includes(
-                                            "Meeting Date"
-                                        )
-                                    ) {
-
-                                        const cells =
-                                            table.querySelectorAll(
-                                                "td"
-                                            );
-
-                                        const current =
-                                            cells.length
-                                                ? cells[0]
-                                                    .textContent
-                                                    .trim()
-                                                : "";
-
-                                        return (
-                                            current &&
-                                            current !== previousDate
-                                        );
-                                    }
-                                }
-
-                                return false;
-                            }
-                            """,
-                            previous_date
-                        )
-
-                    if ready:
-                        break
-
-                except Exception:
-                    pass
-
-
-            time.sleep(0.5)
-
-
-            # ------------------------------------------------
-            # EXTRAER DATOS
-            # ------------------------------------------------
-
-            data =
-                extract_meeting_from_dom(
-                    qs_frame
-                )
-
-
-            if not data or not data.get("table"):
-
-                print(
-                    "  DOM vacío. Usando respaldo de texto..."
-                )
-
-                try:
-
-                    text =
-                        qs_frame.locator(
-                            "body"
-                        ).inner_text(
-                            timeout=5000
-                        )
-
-                    data =
-                        extract_from_text(text)
-
-                except Exception:
-
-                    data = None
-
-
-            if not data:
-                print("  ERROR leyendo reunión.")
-                continue
-
-
-            meeting_date =
-                parse_date(
-                    data.get(
-                        "meeting_date",
-                        ""
+                text =
+                    qs_frame.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=5000
                     )
-                )
 
 
-            summary =
-                data.get(
-                    "summary",
-                    {}
-                )
-
-
-            print(
-                f"  Fecha: {meeting_date}"
-            )
-
-            print(
-                f"  ALZA: "
-                f"{summary.get('hike', 0)}%"
-            )
-
-            print(
-                f"  MANTENER: "
-                f"{summary.get('no_change', 0)}%"
-            )
-
-            print(
-                f"  RECORTE: "
-                f"{summary.get('ease', 0)}%"
-            )
-
-
-            meetings.append({
-
-                "meeting_date":
-                    meeting_date,
-
-                "summary":
-                    summary,
-
-                "table":
-                    data.get(
-                        "table",
-                        []
-                    ),
-
-                "current_target":
-                    data.get(
-                        "current_target",
-                        ""
+                data =
+                    extract_from_text(
+                        text
                     )
-            })
+
+            except Exception:
+
+                data = None
 
 
         browser.close()
 
 
-    if not meetings:
+        if not data:
 
-        raise RuntimeError(
-            "CME no devolvió ninguna reunión."
-        )
-
-
-    return meetings
-
-
-# ============================================================
-# ENCONTRAR PRÓXIMA REUNIÓN
-# ============================================================
-
-def get_next_meeting(meetings):
-
-    today =
-        datetime.now(
-            timezone.utc
-        ).strftime("%Y-%m-%d")
-
-
-    valid = []
-
-    for meeting in meetings:
-
-        date =
-            meeting.get(
-                "meeting_date",
-                ""
+            raise RuntimeError(
+                "No fue posible extraer "
+                "datos de CME."
             )
 
-        if re.match(
-            r"^\d{4}-\d{2}-\d{2}$",
-            date
-        ):
 
-            if date >= today:
-
-                valid.append(meeting)
-
-
-    if not valid:
-        return None
-
-
-    valid.sort(
-        key=lambda x:
-            x["meeting_date"]
-    )
-
-
-    return valid[0]
+        return data
 
 
 # ============================================================
-# DETERMINAR SEÑAL
+# ENCONTRAR PROBABILIDADES REALES
 # ============================================================
 
-def determine_signal(summary):
+def determine_signal(data):
+
+    summary =
+        data.get(
+            "summary",
+            {}
+        )
+
 
     hike =
         float(
@@ -1049,6 +794,7 @@ def determine_signal(summary):
             )
         )
 
+
     ease =
         float(
             summary.get(
@@ -1056,6 +802,7 @@ def determine_signal(summary):
                 0
             )
         )
+
 
     hold =
         float(
@@ -1068,14 +815,11 @@ def determine_signal(summary):
 
     values = {
 
-        "ALZA":
-            hike,
+        "ALZA": hike,
 
-        "RECORTE":
-            ease,
+        "RECORTE": ease,
 
-        "MANTENER":
-            hold
+        "MANTENER": hold
     }
 
 
@@ -1085,15 +829,20 @@ def determine_signal(summary):
             key=values.get
         )
 
+
     probability =
         values[direction]
 
 
-    return direction, probability, values
+    return (
+        direction,
+        probability,
+        values
+    )
 
 
 # ============================================================
-# DECIDIR SI HAY QUE ENVIAR ALERTA
+# ALERTAS
 # ============================================================
 
 def should_alert(
@@ -1105,7 +854,10 @@ def should_alert(
 
     if probability < THRESHOLD:
 
-        return False, "Por debajo de 65%"
+        return (
+            False,
+            "Por debajo de 65%"
+        )
 
 
     previous_meeting =
@@ -1113,10 +865,12 @@ def should_alert(
             "meeting_date"
         )
 
+
     previous_direction =
         state.get(
             "direction"
         )
+
 
     previous_probability =
         state.get(
@@ -1124,47 +878,55 @@ def should_alert(
         )
 
 
-    # Primera señal
     if previous_meeting is None:
 
-        return True, "Primera señal >=65%"
+        return (
+            True,
+            "Primera señal >=65%"
+        )
 
 
-    # Cambió la reunión
     if previous_meeting != meeting_date:
 
-        return True, "Nueva reunión FOMC"
+        return (
+            True,
+            "Nueva reunión FOMC"
+        )
 
 
-    # Cambió la dirección
     if (
         previous_direction
         and
         previous_direction != direction
     ):
 
-        return True, "Cambio de dirección"
+        return (
+            True,
+            "Cambio de dirección"
+        )
 
 
-    # Cambio >= 10 puntos
     if previous_probability is not None:
 
         difference =
             abs(
-                probability
-                -
+                probability -
                 float(previous_probability)
             )
 
+
         if difference >= CHANGE_ALERT:
 
-            return True, (
-                f"Cambio de "
-                f"{difference:.1f} puntos"
+            return (
+                True,
+                f"Cambio de {difference:.1f} puntos"
             )
 
 
-    return False, "Sin cambio suficiente"
+    return (
+        False,
+        "Sin cambio suficiente"
+    )
 
 
 # ============================================================
@@ -1182,7 +944,7 @@ def send_ntfy(
     if not NTFY_TOPIC:
 
         print(
-            "ERROR: falta el secreto NTFY_TOPIC."
+            "ERROR: falta NTFY_TOPIC."
         )
 
         return False
@@ -1220,27 +982,23 @@ def send_ntfy(
 
         response =
             requests.post(
-
                 f"https://ntfy.sh/{NTFY_TOPIC}",
-
                 data=message.encode(
                     "utf-8"
                 ),
-
                 headers={
                     "Title": title,
                     "Priority": "high",
                     "Tags": "chart_with_upwards_trend"
                 },
-
                 timeout=20
             )
 
 
-        if response.status_code >= 200 and response.status_code < 300:
+        if 200 <= response.status_code < 300:
 
             print(
-                "✓ Notificación enviada a ntfy."
+                "✓ Notificación enviada."
             )
 
             return True
@@ -1261,7 +1019,7 @@ def send_ntfy(
     except Exception as error:
 
         print(
-            f"ERROR enviando ntfy: {error}"
+            f"ERROR ntfy: {error}"
         )
 
         return False
@@ -1274,110 +1032,111 @@ def send_ntfy(
 def main():
 
     print()
-    print(
-        "============================================================"
-    )
-    print(
-        "CME FEDWATCH MONITOR"
-    )
-    print(
-        "============================================================"
-    )
+    print("=" * 60)
+    print("CME FEDWATCH MONITOR")
+    print("=" * 60)
 
     print(
         f"Umbral: {THRESHOLD}%"
     )
 
     print(
-        f"Cambio para alerta: {CHANGE_ALERT} puntos"
+        f"Cambio para alerta: "
+        f"{CHANGE_ALERT} puntos"
     )
 
     print(
-        f"Hora UTC: "
+        "Hora UTC: "
         f"{datetime.now(timezone.utc).isoformat()}"
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # SCRAPE
-    # --------------------------------------------------------
+    # ========================================================
 
-    meetings =
+    data =
         scrape_fedwatch()
 
 
-    # --------------------------------------------------------
-    # PRÓXIMA REUNIÓN
-    # --------------------------------------------------------
-
-    next_meeting =
-        get_next_meeting(
-            meetings
-        )
-
-
-    if not next_meeting:
-
-        raise RuntimeError(
-            "No se encontró la próxima reunión FOMC."
-        )
-
+    # ========================================================
+    # FECHA
+    # ========================================================
 
     meeting_date =
-        next_meeting[
-            "meeting_date"
-        ]
-
-    summary =
-        next_meeting[
-            "summary"
-        ]
+        parse_date(
+            data.get(
+                "meeting_date",
+                ""
+            )
+        )
 
 
-    # --------------------------------------------------------
+    if not meeting_date:
+
+        # Si CME no entrega fecha en el primer
+        # campo, intentamos buscarla nuevamente
+        # dentro del texto.
+
+        meeting_date =
+            data.get(
+                "meeting_date",
+                ""
+            )
+
+
+    if not meeting_date:
+
+        raise RuntimeError(
+            "CME no entregó la fecha "
+            "de la reunión."
+        )
+
+
+    # ========================================================
     # SEÑAL
-    # --------------------------------------------------------
+    # ========================================================
 
     direction, probability, values =
         determine_signal(
-            summary
+            data
         )
 
 
     print()
+    print("=" * 60)
+
     print(
-        "============================================================"
+        f"REUNIÓN: {meeting_date}"
     )
 
     print(
-        f"PRÓXIMA REUNIÓN: {meeting_date}"
+        f"🔴 ALZA: "
+        f"{values['ALZA']:.1f}%"
     )
 
     print(
-        f"🔴 ALZA: {values['ALZA']:.1f}%"
+        f"🟢 RECORTE: "
+        f"{values['RECORTE']:.1f}%"
     )
 
     print(
-        f"🟢 RECORTE: {values['RECORTE']:.1f}%"
+        f"⚪ MANTENER: "
+        f"{values['MANTENER']:.1f}%"
     )
 
     print(
-        f"⚪ MANTENER: {values['MANTENER']:.1f}%"
-    )
-
-    print(
-        f"SEÑAL PRINCIPAL: {direction} "
+        f"SEÑAL: "
+        f"{direction} "
         f"{probability:.1f}%"
     )
 
-    print(
-        "============================================================"
-    )
+    print("=" * 60)
 
 
-    # --------------------------------------------------------
-    # ESTADO ANTERIOR
-    # --------------------------------------------------------
+    # ========================================================
+    # ESTADO
+    # ========================================================
 
     state =
         load_state()
@@ -1393,7 +1152,8 @@ def main():
 
 
     print(
-        f"Alerta: {'SÍ' if alert else 'NO'}"
+        f"Alerta: "
+        f"{'SÍ' if alert else 'NO'}"
     )
 
     print(
@@ -1401,53 +1161,50 @@ def main():
     )
 
 
-    # --------------------------------------------------------
-    # ENVIAR ALERTA
-    # --------------------------------------------------------
+    # ========================================================
+    # ENVIAR
+    # ========================================================
 
     if alert:
 
-        send_ntfy(
-            direction,
-            probability,
-            meeting_date,
-            values,
-            reason
-        )
-
-
-        # Guardamos solamente el último estado
-        # que produjo una alerta.
-        #
-        # Así NO se generan notificaciones cada
-        # 15 minutos mientras el dato permanezca igual.
-
-        state = {
-
-            "meeting_date":
-                meeting_date,
-
-            "direction":
+        sent =
+            send_ntfy(
                 direction,
-
-            "probability":
                 probability,
-
-            "updated_at":
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-        }
+                meeting_date,
+                values,
+                reason
+            )
 
 
-        save_state(
-            state
-        )
+        if sent:
 
-        print(
-            "✓ Estado actualizado."
-        )
+            state = {
 
+                "meeting_date":
+                    meeting_date,
+
+                "direction":
+                    direction,
+
+                "probability":
+                    probability,
+
+                "updated_at":
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+            }
+
+
+            save_state(
+                state
+            )
+
+
+            print(
+                "✓ Estado guardado."
+            )
 
     else:
 
@@ -1456,11 +1213,14 @@ def main():
         )
 
 
-    print()
     print(
-        "Proceso terminado correctamente."
+        "Proceso terminado."
     )
 
+
+# ============================================================
+# EJECUCIÓN
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -1471,20 +1231,11 @@ if __name__ == "__main__":
     except Exception as error:
 
         print()
-        print(
-            "============================================================"
-        )
-
-        print(
-            "ERROR"
-        )
-
+        print("=" * 60)
+        print("ERROR")
+        print("=" * 60)
         print(
             str(error)
-        )
-
-        print(
-            "============================================================"
         )
 
         sys.exit(1)
