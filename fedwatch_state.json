@@ -1,7 +1,7 @@
 {
   "meeting_date": "2026-10-28",
-  "probability": 50.7,
-  "direction": "hold",
+  "probability": 50.4,
+  "direction": "hike",
   "above_threshold": false,
-  "updated_at": "2026-09-29T20:08:10.993559+00:00"
+  "updated_at": "2026-09-29T23:43:37.401681+00:00"
 }
